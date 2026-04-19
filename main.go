@@ -40,8 +40,9 @@ func main() {
 
 	// Chunk cache (shared across all services) for xet content-addressable
 	// storage. Lives under the main cache dir so both caches share a single
-	// on-disk root the user configured.
-	chunks, err := newChunkCache(filepath.Join(cfg.Cache.Dir, "xet-chunks"))
+	// on-disk root the user configured. Shares the same max-size budget
+	// (independent eviction; worst-case disk use is 2×max-size).
+	chunks, err := newChunkCache(filepath.Join(cfg.Cache.Dir, "xet-chunks"), cfg.Cache.MaxSize)
 	if err != nil {
 		log.Fatalf("chunk cache: %v", err)
 	}
@@ -70,6 +71,7 @@ func main() {
 		s.Close()
 	}
 	cache.Close()
+	chunks.Close()
 }
 
 func defaultStateDir() (string, error) {

@@ -53,7 +53,7 @@ func TestChunkCache_HitSkipsUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cc, err := newChunkCache(t.TempDir())
+	cc, err := newChunkCache(t.TempDir(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestChunkCache_SingleflightDedup(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cc, err := newChunkCache(t.TempDir())
+	cc, err := newChunkCache(t.TempDir(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,6 +132,57 @@ func TestChunkCache_SingleflightDedup(t *testing.T) {
 	}
 }
 
+// checkEviction should remove oldest-accessed entries once sizeBytes goes
+// over the max.
+func TestChunkCache_LRUEvicts(t *testing.T) {
+	body := "0123456789" // 10 bytes per chunk
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, body)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	// Each stored entry is the HTTP wire format of the response (~80 bytes
+	// for our tiny body). Budget fits 2 entries, forcing 1 eviction after
+	// the 3rd arrives.
+	cc, err := newChunkCache(dir, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+
+	fetch := func() (*http.Response, error) {
+		req, _ := http.NewRequest("GET", upstream.URL, nil)
+		return http.DefaultClient.Do(req)
+	}
+
+	// Prime A, B, C with ascending access time.
+	for _, k := range []string{"ka", "kb", "kc"} {
+		rec := httptest.NewRecorder()
+		cc.serve(rec, httptest.NewRequest("GET", "/x", nil), k, fetch)
+		time.Sleep(2 * time.Millisecond)
+	}
+	// A's lastAccess is oldest; checkEviction should drop it first.
+	before := cc.sizeBytes.Load()
+	cc.checkEviction()
+	after := cc.sizeBytes.Load()
+	if after >= before {
+		t.Errorf("sizeBytes unchanged: %d -> %d (expected shrink under maxSize)", before, after)
+	}
+	cc.mu.Lock()
+	_, hasA := cc.entries["ka"]
+	_, hasC := cc.entries["kc"]
+	cc.mu.Unlock()
+	if hasA {
+		t.Error("expected ka (oldest) to be evicted")
+	}
+	if !hasC {
+		t.Error("expected kc (newest) to survive")
+	}
+}
+
 // Non-200/206 responses are not cached: the next call re-fetches.
 func TestChunkCache_NonSuccessNotCached(t *testing.T) {
 	var hits atomic.Int64
@@ -142,7 +193,7 @@ func TestChunkCache_NonSuccessNotCached(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cc, err := newChunkCache(t.TempDir())
+	cc, err := newChunkCache(t.TempDir(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

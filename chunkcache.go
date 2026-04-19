@@ -11,8 +11,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // chunkCache is a content-addressable HTTP response cache used by the xet
@@ -28,17 +31,157 @@ import (
 // is parsed back with http.ReadResponse and streamed directly. Per-key
 // singleflight dedups concurrent fetches.
 type chunkCache struct {
-	dir string
+	dir     string
+	maxSize int64 // 0 → no eviction
 
 	mu       sync.Mutex
 	inflight map[string]chan struct{}
+	entries  map[string]*chunkEntry // key → metadata for LRU eviction
+
+	sizeBytes atomic.Int64
+
+	closeOnce sync.Once
+	closeCh   chan struct{}
+	wg        sync.WaitGroup
 }
 
-func newChunkCache(dir string) (*chunkCache, error) {
+type chunkEntry struct {
+	size       int64
+	lastAccess atomic.Int64 // time.Now().UnixNano at last hit
+}
+
+const chunkEvictionInterval = time.Minute
+
+func newChunkCache(dir string, maxSize int64) (*chunkCache, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &chunkCache{dir: dir, inflight: map[string]chan struct{}{}}, nil
+	cc := &chunkCache{
+		dir:      dir,
+		maxSize:  maxSize,
+		inflight: map[string]chan struct{}{},
+		entries:  map[string]*chunkEntry{},
+		closeCh:  make(chan struct{}),
+	}
+	cc.load()
+	if maxSize > 0 {
+		cc.wg.Add(1)
+		go cc.evictLoop()
+	}
+	return cc, nil
+}
+
+// Close stops background eviction. Safe to call multiple times.
+func (cc *chunkCache) Close() {
+	cc.closeOnce.Do(func() { close(cc.closeCh) })
+	cc.wg.Wait()
+}
+
+// load scans the cache dir on startup, populating entries and sizeBytes
+// from existing files. Orphaned temp files (from crashes mid-fill) are
+// reaped.
+func (cc *chunkCache) load() {
+	tops, err := os.ReadDir(cc.dir)
+	if err != nil {
+		return
+	}
+	for _, top := range tops {
+		if !top.IsDir() {
+			continue
+		}
+		sub := filepath.Join(cc.dir, top.Name())
+		subs, err := os.ReadDir(sub)
+		if err != nil {
+			continue
+		}
+		for _, e := range subs {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.HasSuffix(name, ".tmp") {
+				os.Remove(filepath.Join(sub, name))
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			entry := &chunkEntry{size: info.Size()}
+			entry.lastAccess.Store(info.ModTime().UnixNano())
+			cc.entries[name] = entry
+			cc.sizeBytes.Add(info.Size())
+		}
+	}
+}
+
+func (cc *chunkCache) evictLoop() {
+	defer cc.wg.Done()
+	t := time.NewTicker(chunkEvictionInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-cc.closeCh:
+			return
+		case <-t.C:
+			cc.checkEviction()
+		}
+	}
+}
+
+// checkEviction deletes oldest-accessed entries until sizeBytes <= maxSize.
+// Deletes are idempotent from the reader's POV — an in-progress read holds
+// an open fd on the unlinked file and continues until it closes.
+func (cc *chunkCache) checkEviction() {
+	if cc.sizeBytes.Load() <= cc.maxSize {
+		return
+	}
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	type cand struct {
+		key string
+		e   *chunkEntry
+	}
+	cands := make([]cand, 0, len(cc.entries))
+	for k, e := range cc.entries {
+		cands = append(cands, cand{k, e})
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		return cands[i].e.lastAccess.Load() < cands[j].e.lastAccess.Load()
+	})
+	for _, c := range cands {
+		if cc.sizeBytes.Load() <= cc.maxSize {
+			break
+		}
+		p := cc.path(c.key)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Printf("chunkcache: evict %s: %v", c.key, err)
+			continue
+		}
+		delete(cc.entries, c.key)
+		cc.sizeBytes.Add(-c.e.size)
+	}
+}
+
+// touch records access for a key, so recently-used entries survive
+// eviction.
+func (cc *chunkCache) touch(key string) {
+	cc.mu.Lock()
+	e, ok := cc.entries[key]
+	cc.mu.Unlock()
+	if ok {
+		e.lastAccess.Store(time.Now().UnixNano())
+	}
+}
+
+// admit registers a freshly-written entry in the LRU bookkeeping.
+func (cc *chunkCache) admit(key string, size int64) {
+	entry := &chunkEntry{size: size}
+	entry.lastAccess.Store(time.Now().UnixNano())
+	cc.mu.Lock()
+	cc.entries[key] = entry
+	cc.mu.Unlock()
+	cc.sizeBytes.Add(size)
 }
 
 func (cc *chunkCache) path(key string) string {
@@ -155,6 +298,10 @@ func (cc *chunkCache) streamAndCache(w http.ResponseWriter, key string, resp *ht
 	if err := os.Rename(tmpPath, p); err != nil {
 		log.Printf("chunkcache: rename: %v", err)
 		os.Remove(tmpPath)
+		return
+	}
+	if info, err := os.Stat(p); err == nil {
+		cc.admit(key, info.Size())
 	}
 }
 
@@ -182,9 +329,16 @@ func (cc *chunkCache) tryServe(w http.ResponseWriter, key string) bool {
 	if err != nil {
 		// Corrupt cache file — delete and miss.
 		os.Remove(p)
+		cc.mu.Lock()
+		if e, ok := cc.entries[key]; ok {
+			delete(cc.entries, key)
+			cc.sizeBytes.Add(-e.size)
+		}
+		cc.mu.Unlock()
 		return false
 	}
 	defer resp.Body.Close()
+	cc.touch(key)
 	for k, vs := range resp.Header {
 		if isHopByHop(k, resp.Header.Get("Connection")) {
 			continue
