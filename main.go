@@ -38,6 +38,14 @@ func main() {
 		log.Fatalf("cache: %v", err)
 	}
 
+	// Chunk cache (shared across all services) for xet content-addressable
+	// storage. Lives under the main cache dir so both caches share a single
+	// on-disk root the user configured.
+	chunks, err := newChunkCache(filepath.Join(cfg.Cache.Dir, "xet-chunks"))
+	if err != nil {
+		log.Fatalf("chunk cache: %v", err)
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -46,9 +54,9 @@ func main() {
 		var svc *Service
 		if *local {
 			addr := fmt.Sprintf("127.0.0.1:%d", *localPort+i)
-			svc = NewLocalService(sc, addr, cache)
+			svc = NewLocalService(sc, addr, cache, chunks)
 		} else {
-			svc = NewService(sc, stateDir, cache)
+			svc = NewService(sc, stateDir, cache, chunks)
 		}
 		if err := svc.Start(ctx); err != nil {
 			log.Fatalf("%s: %v", sc.Name, err)

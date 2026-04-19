@@ -79,7 +79,7 @@ func TestXet_RewriteReconstructionBody(t *testing.T) {
 }
 
 func TestXet_ProxyRouter_ForbiddenHost(t *testing.T) {
-	h := xetProxyRouter(http.DefaultClient, nil)
+	h := xetProxyRouter(http.DefaultClient, nil, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/_proxy/evil.example.com/foo", nil))
 	if rec.Code != http.StatusForbidden {

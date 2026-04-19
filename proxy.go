@@ -19,9 +19,10 @@ type Service struct {
 	ts        *tsnet.Server // nil in local mode
 	localAddr string        // non-empty in local mode
 	cache     *Cache
+	chunks    *chunkCache // xet adapter's content-addressable chunk cache
 }
 
-func NewService(cfg ServiceConfig, stateDir string, cache *Cache) *Service {
+func NewService(cfg ServiceConfig, stateDir string, cache *Cache, chunks *chunkCache) *Service {
 	s := &Service{
 		cfg: cfg,
 		ts: &tsnet.Server{
@@ -29,6 +30,7 @@ func NewService(cfg ServiceConfig, stateDir string, cache *Cache) *Service {
 			Dir:      filepath.Join(stateDir, cfg.Hostname),
 			Logf:     func(string, ...any) {},
 		},
+		chunks: chunks,
 	}
 	if cfg.Cache {
 		s.cache = cache
@@ -38,8 +40,8 @@ func NewService(cfg ServiceConfig, stateDir string, cache *Cache) *Service {
 
 // NewLocalService binds the service to a plain localhost addr instead of tsnet.
 // `listen` config is ignored — local always serves plain HTTP on the given addr.
-func NewLocalService(cfg ServiceConfig, addr string, cache *Cache) *Service {
-	s := &Service{cfg: cfg, localAddr: addr}
+func NewLocalService(cfg ServiceConfig, addr string, cache *Cache, chunks *chunkCache) *Service {
+	s := &Service{cfg: cfg, localAddr: addr, chunks: chunks}
 	if cfg.Cache {
 		s.cache = cache
 	}
@@ -111,7 +113,7 @@ func (s *Service) handler() http.Handler {
 		// Separate http.Client for /_proxy/ forwarding: unlike c.client we
 		// don't want ResponseHeaderTimeout biting on streaming CAS body
 		// fetches (reconstruction downloads can take a while).
-		proxyRouter = xetProxyRouter(&http.Client{}, modify)
+		proxyRouter = xetProxyRouter(&http.Client{}, modify, s.chunks)
 	}
 
 	var inner http.Handler

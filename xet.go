@@ -130,9 +130,11 @@ func rewriteBodyHostURLs(clientBase string, resp *http.Response) error {
 
 // xetProxyRouter handles /_proxy/<host>/<path> requests by forwarding to
 // https://<host>/<path> (preserving method, headers, body, query). Enforces
-// the xetAllowedHosts SSRF guard. Applies the response modifier so CAS
-// responses get their embedded URLs rewritten.
-func xetProxyRouter(client *http.Client, modifier func(*http.Response) error) http.Handler {
+// the xetAllowedHostSuffix SSRF guard. Applies the response modifier so CAS
+// responses get their embedded URLs rewritten. If chunks is non-nil, xorb
+// GET requests go through the content-addressable cache instead of direct
+// forward — hits skip the upstream entirely.
+func xetProxyRouter(client *http.Client, modifier func(*http.Response) error, chunks *chunkCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, proxyPathPrefix)
 		slash := strings.IndexByte(rest, '/')
@@ -146,33 +148,44 @@ func xetProxyRouter(client *http.Client, modifier func(*http.Response) error) ht
 			return
 		}
 
-		target := &url.URL{
-			Scheme:   "https",
-			Host:     host,
-			Path:     path,
-			RawQuery: r.URL.RawQuery,
-		}
-		out, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body)
-		if err != nil {
-			http.Error(w, "proxy: build: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		connHdr := r.Header.Get("Connection")
-		for k, vs := range r.Header {
-			if isHopByHop(k, connHdr) {
-				continue
+		forward := func() (*http.Response, error) {
+			target := &url.URL{
+				Scheme:   "https",
+				Host:     host,
+				Path:     path,
+				RawQuery: r.URL.RawQuery,
 			}
-			out.Header[k] = append([]string{}, vs...)
+			out, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body)
+			if err != nil {
+				return nil, err
+			}
+			connHdr := r.Header.Get("Connection")
+			for k, vs := range r.Header {
+				if isHopByHop(k, connHdr) {
+					continue
+				}
+				out.Header[k] = append([]string{}, vs...)
+			}
+			out.Host = host
+			return client.Do(out)
 		}
-		out.Host = host
 
-		resp, err := client.Do(out)
+		// Content-addressable cache for xorb chunks.
+		if chunks != nil && r.Method == http.MethodGet {
+			if key, ok := xetChunkKey(host, path, r.URL.RawQuery); ok {
+				chunks.serve(w, r, key, forward)
+				return
+			}
+		}
+
+		// Direct forward + response modifier (for cas-server / non-xorb
+		// paths that embed URLs needing rewrite).
+		resp, err := forward()
 		if err != nil {
 			http.Error(w, "proxy: upstream: "+err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
-
 		if modifier != nil {
 			if err := modifier(resp); err != nil {
 				http.Error(w, "proxy: modify: "+err.Error(), http.StatusBadGateway)
