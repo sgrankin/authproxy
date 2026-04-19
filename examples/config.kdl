@@ -13,10 +13,10 @@ service "huggingface" {
     listen "http" "https"
     header "Authorization" "Bearer ${env:HF_TOKEN}"
 
-    // Enable xet passthrough: HF's CAS traffic (cas-server.xethub.hf.co,
-    // cas-bridge.xethub.hf.co) is rewritten to flow through /_proxy/<host>/
-    // on this same hostname, so clients stay on the proxy for CAS + chunk
-    // fetches and keep their network boundary. See CLAUDE.md.
+    // Enable xet passthrough: HF's CAS traffic (hosts under *.xethub.hf.co)
+    // is rewritten to flow through /_proxy/<host>/ on this same hostname,
+    // so clients stay on the proxy for CAS + chunk fetches and benefit
+    // from the content-addressable chunk cache. See CLAUDE.md.
     adapter "xet"
 }
 

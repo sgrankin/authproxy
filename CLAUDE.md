@@ -37,19 +37,49 @@ content hash that's stable across CDN boundary crossings where the CDN's
 ETag is not. The CDN's ETag is stashed as `UpstreamETag` and used for
 `If-Match` on chunked Range GETs (the CDN doesn't know X-Linked-Etag).
 
-## Xet suppression (HF-specific)
+## Xet adapter (HF-specific)
 
-HF's HEAD responses carry xet hints (`X-Xet-Hash`, `Link: …; rel="xet-auth"
-/ "xet-reconstruction-info"`). When present and `hf_xet` is installed, the
-client bypasses this proxy on the body fetch and talks directly to
-`cas-server.xethub.hf.co` / `cas-bridge.xethub.hf.co`. That defeats both
-the cache and — for locked-down clients — the network boundary.
+HF's HEAD responses advertise xet storage via `X-Xet-Hash` and a `Link`
+header with `rel="xet-auth"` / `rel="xet-reconstruction-info"`. Natively,
+`hf_xet` uses these to bypass `huggingface.co` and talk directly to
+`cas-server.xethub.hf.co` (reconstruction metadata) and
+`transfer.xethub.hf.co` / `cas-bridge.xethub.hf.co` (chunk bytes via
+presigned URLs). That's ~7× faster than the HTTP/LFS path but bypasses
+this proxy.
 
-The example config strips those headers via `block-response-header`,
-forcing hf_hub onto the `http_get` path that goes through this proxy and
-populates the cache. If you ever want xet passthrough, you'd need to also
-proxy the two xethub hosts and rewrite CAS reconstruction responses; see
-the discussion around commit 19424606 / cache.go's discover.
+Enable `adapter "xet"` on a service to keep that traffic on the proxy:
+
+1. `/_proxy/<host>/<path>` requests are forwarded to `https://<host>/<path>`
+   for any host under `.xethub.hf.co` (SSRF guard via suffix match).
+2. The `X-Xet-Cas-Url` header on `xet-read-token` responses gets rewritten
+   to `<clientBase>/_proxy/cas-server.xethub.hf.co`. Since `hf_xet` reads
+   this header to learn its CAS endpoint, the proxy becomes invisible
+   infrastructure to the client.
+3. Response bodies on `xet-read-token` and `/v1/reconstructions/...` are
+   byte-scanned and rewritten to redirect any `https://<xet-host>/…` URL
+   through `/_proxy/<xet-host>/…`. The S3 presigned signatures stay valid:
+   they sign `host` only, and the proxy restores the original `Host` on
+   the forwarded request.
+
+See `xet.go` / `chunkcache.go`.
+
+### Chunk cache
+
+Chunk GETs (paths `/xorbs/...` and `/xet-bridge-us/...`) go through a
+content-addressable cache keyed by `sha256(host + path + X-Xet-Signed-Range)`.
+Hits skip the upstream entirely. Different ranges of the same xorb get
+separate entries (same as `hf_xet`'s client-side cache). The cache uses
+`sync.Map`-style singleflight to dedup concurrent fetches and independent
+LRU eviction against `cache.max-size`. Fills stream via `io.TeeReader` —
+client sees bytes as they arrive; disk write runs concurrently; temp files
+are cleaned up on client disconnect or copy error.
+
+### One tsnet hostname, path-multiplexed
+
+All xet traffic goes through the same hostname as the parent service
+(`hf.tail172cc.ts.net`). Extra xet hostnames were rejected because each
+tsnet device needs Tailscale admin approval — the path-prefix approach
+stays under one approval and doesn't clutter the admin view.
 
 ## Config
 

@@ -18,6 +18,11 @@ Inspired by ["The HTTP proxy is the best secrets manager"](https://blog.exe.dev/
 - **Optional caching** — slice/chunked store backed by per-chunk files. Honors
   strong `ETag` for revalidation; supports `Range` requests against the cache;
   per-blob LRU eviction; URL→ETag map persisted across restarts.
+- **Protocol adapters** — per-service hooks for protocols that can't be
+  handled as plain HTTP. Currently: `adapter "xet"` proxies HuggingFace's
+  xet storage traffic through this host (instead of the client talking
+  directly to `*.xethub.hf.co`), with a content-addressable chunk cache
+  keyed by the Xet signed range.
 
 ## Quick start
 
