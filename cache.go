@@ -198,12 +198,18 @@ func (c *Cache) load() error {
 			continue
 		}
 		blobDir := filepath.Join(c.dir, e.Name())
+		// Only treat dirs with a meta.json as blobs. Other sub-dirs under
+		// cache.Dir belong to sibling components (xet-chunks/ in
+		// particular). Before this check, those dirs were mis-identified
+		// as corrupt blobs and deleted on every startup.
+		if _, err := os.Stat(filepath.Join(blobDir, "meta.json")); err != nil {
+			continue
+		}
 		b, err := loadBlob(blobDir, c)
 		if err != nil {
-			// Failed-to-load blob dirs are unrecoverable (corrupt meta,
-			// missing files, etc.) and don't contribute to sizeBytes — so
-			// LRU eviction can't reclaim them. Reap on startup.
-			log.Printf("cache: removing unloadable blob dir %s: %v", e.Name(), err)
+			// meta.json was present but we couldn't parse the blob —
+			// genuinely corrupt. Reap it.
+			log.Printf("cache: removing corrupt blob dir %s: %v", e.Name(), err)
 			if rerr := os.RemoveAll(blobDir); rerr != nil {
 				log.Printf("cache: remove %s: %v", e.Name(), rerr)
 			}
