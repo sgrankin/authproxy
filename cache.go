@@ -32,7 +32,15 @@ type Cache struct {
 	mu    sync.Mutex
 	blobs map[string]*blob  // blobKey → blob
 	etags map[string]string // requestKey → last-known strong ETag
+
+	sizeBytes atomic.Int64 // sum of bytes across all complete chunks of all blobs
+
+	closeOnce sync.Once
+	closeCh   chan struct{}
+	wg        sync.WaitGroup
 }
+
+const evictionInterval = time.Minute
 
 // NewCache opens (or creates) a cache rooted at dir.
 func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
@@ -48,6 +56,7 @@ func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
 		maxSize:   maxSize,
 		blobs:     map[string]*blob{},
 		etags:     map[string]string{},
+		closeCh:   make(chan struct{}),
 		client: &http.Client{
 			Transport: &http.Transport{
 				ResponseHeaderTimeout: 30 * time.Second,
@@ -57,7 +66,80 @@ func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
 	if err := c.load(); err != nil {
 		return nil, err
 	}
+	if maxSize > 0 {
+		c.wg.Add(1)
+		go c.evictLoop()
+	}
 	return c, nil
+}
+
+// Close stops background eviction. Safe to call multiple times.
+func (c *Cache) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closeCh)
+	})
+	c.wg.Wait()
+	return nil
+}
+
+func (c *Cache) evictLoop() {
+	defer c.wg.Done()
+	t := time.NewTicker(evictionInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-t.C:
+			c.checkEviction()
+		}
+	}
+}
+
+// checkEviction removes least-recently-accessed blobs until total size is
+// under maxSize. Blobs with active reads/fills (inFlight > 0) are skipped.
+func (c *Cache) checkEviction() {
+	if c.sizeBytes.Load() <= c.maxSize {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	type cand struct {
+		b   *blob
+		ts  int64
+	}
+	cands := make([]cand, 0, len(c.blobs))
+	for _, b := range c.blobs {
+		if b.inFlight.Load() == 0 {
+			cands = append(cands, cand{b, b.lastAccess.Load()})
+		}
+	}
+	// Sort by lastAccess ascending (oldest first). Small N expected; bubble-style sort is fine.
+	for i := 1; i < len(cands); i++ {
+		for j := i; j > 0 && cands[j-1].ts > cands[j].ts; j-- {
+			cands[j-1], cands[j] = cands[j], cands[j-1]
+		}
+	}
+	for _, cd := range cands {
+		if c.sizeBytes.Load() <= c.maxSize {
+			break
+		}
+		b := cd.b
+		// Re-check refcount under cache lock — eviction holds c.mu, and
+		// acquireBlob bumps refcount under c.mu, so this is race-free.
+		if b.inFlight.Load() > 0 {
+			continue
+		}
+		delete(c.blobs, b.key)
+		freed := b.bytes.Load()
+		if err := os.RemoveAll(b.dir); err != nil {
+			log.Printf("cache: evict %s: %v", b.key, err)
+			continue
+		}
+		c.sizeBytes.Add(-freed)
+		log.Printf("cache: evicted %s (%d bytes)", b.key, freed)
+	}
 }
 
 func (c *Cache) load() error {
@@ -70,7 +152,7 @@ func (c *Cache) load() error {
 			continue
 		}
 		blobDir := filepath.Join(c.dir, e.Name())
-		b, err := loadBlob(blobDir)
+		b, err := loadBlob(blobDir, c)
 		if err != nil {
 			log.Printf("cache: skipping %s: %v", e.Name(), err)
 			continue
@@ -125,7 +207,8 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 
 	// 304: cached entry, if still present, is authoritative.
 	if etag == knownETag && etag != "" {
-		if b := c.lookupBlob(blobKey(upstream, etag)); b != nil {
+		if b := c.acquireBlob(blobKey(upstream, etag)); b != nil {
+			defer b.release()
 			c.serveFromBlob(w, r, upstream, headers, b)
 			return
 		}
@@ -152,6 +235,11 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 	c.mu.Unlock()
 
 	b := c.getOrCreateBlob(upstream, etag, meta)
+	if b == nil {
+		c.passthrough(w, r, upstream, headers)
+		return
+	}
+	defer b.release()
 	c.serveFromBlob(w, r, upstream, headers, b)
 }
 
@@ -193,17 +281,28 @@ func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request
 	}
 }
 
-func (c *Cache) lookupBlob(key string) *blob {
+// acquireBlob looks up a blob by key and bumps its in-flight refcount before
+// returning. Returns nil if not present. Caller must call b.release() when done
+// to allow eviction. Atomic with eviction (which also takes c.mu).
+func (c *Cache) acquireBlob(key string) *blob {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.blobs[key]
+	b, ok := c.blobs[key]
+	if !ok {
+		return nil
+	}
+	b.acquire()
+	return b
 }
 
+// getOrCreateBlob returns an existing blob (with refcount incremented) or
+// creates a new one. Caller must release.
 func (c *Cache) getOrCreateBlob(upstream *url.URL, etag string, meta blobMeta) *blob {
 	key := blobKey(upstream, etag)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if b, ok := c.blobs[key]; ok {
+		b.acquire()
 		return b
 	}
 	b := &blob{
@@ -211,12 +310,14 @@ func (c *Cache) getOrCreateBlob(upstream *url.URL, etag string, meta blobMeta) *
 		dir:       filepath.Join(c.dir, key),
 		meta:      meta,
 		chunkSize: meta.ChunkSize,
+		cache:     c,
 	}
 	if err := b.init(); err != nil {
 		log.Printf("cache: blob init %s: %v", key, err)
 		return nil
 	}
 	c.blobs[key] = b
+	b.acquire()
 	return b
 }
 
@@ -540,11 +641,28 @@ type blob struct {
 	dir       string
 	meta      blobMeta
 	chunkSize int64
+	cache     *Cache // back-ref for size accounting
 
 	mu         sync.Mutex
 	chunks     []chunkSlot
 	lastAccess atomic.Int64
+	inFlight   atomic.Int32 // active reads/fills; eviction skips while >0
+	bytes      atomic.Int64 // sum of complete chunk file sizes
 }
+
+func (b *blob) acquire() { b.inFlight.Add(1) }
+func (b *blob) release() { b.inFlight.Add(-1) }
+
+// chunkCompleted records that a chunk became complete. Must be called exactly
+// once per chunk transitioning from empty to complete.
+func (b *blob) chunkCompleted(idx int) {
+	size := b.expectedChunkSize(idx)
+	b.bytes.Add(size)
+	if b.cache != nil {
+		b.cache.sizeBytes.Add(size)
+	}
+}
+
 
 type chunkState uint8
 
@@ -569,16 +687,17 @@ func (b *blob) init() error {
 	}
 	n := chunkCount(b.meta.ContentLength, b.chunkSize)
 	b.chunks = make([]chunkSlot, n)
-	// Mark already-present chunks complete.
+	// Mark already-present chunks complete (e.g. partial fill from a prior run).
 	for i := range b.chunks {
 		if statOK(b.chunkPath(i), b.expectedChunkSize(i)) {
 			b.chunks[i].state = chunkComplete
+			b.chunkCompleted(i)
 		}
 	}
 	return nil
 }
 
-func loadBlob(dir string) (*blob, error) {
+func loadBlob(dir string, cache *Cache) (*blob, error) {
 	var meta blobMeta
 	f, err := os.Open(filepath.Join(dir, "meta.json"))
 	if err != nil {
@@ -594,12 +713,14 @@ func loadBlob(dir string) (*blob, error) {
 		dir:       dir,
 		meta:      meta,
 		chunkSize: meta.ChunkSize,
+		cache:     cache,
 	}
 	n := chunkCount(meta.ContentLength, meta.ChunkSize)
 	b.chunks = make([]chunkSlot, n)
 	for i := range b.chunks {
 		if statOK(b.chunkPath(i), b.expectedChunkSize(i)) {
 			b.chunks[i].state = chunkComplete
+			b.chunkCompleted(i)
 		}
 	}
 	return b, nil
@@ -649,6 +770,7 @@ func (b *blob) ensureChunk(ctx context.Context, idx int, fetch func(ctx context.
 		s.err = err
 		if err == nil {
 			s.state = chunkComplete
+			b.chunkCompleted(idx)
 		} else {
 			s.state = chunkEmpty
 			// Remove any partial file so future retries start clean.

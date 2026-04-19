@@ -61,6 +61,7 @@ func main() {
 	for _, s := range services {
 		s.Close()
 	}
+	cache.Close()
 }
 
 func defaultStateDir() (string, error) {

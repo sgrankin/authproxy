@@ -228,6 +228,83 @@ func TestCache_VaryRefuses(t *testing.T) {
 	}
 }
 
+func TestCache_LRUEviction(t *testing.T) {
+	body := strings.Repeat("x", 16) // 16 bytes per blob
+	srvA := fakeUpstream(body, `"a"`, nil)
+	defer srvA.Close()
+	srvB := fakeUpstream(body, `"b"`, nil)
+	defer srvB.Close()
+
+	c, err := NewCache(t.TempDir(), 24, 4<<20) // maxSize 24 → fits 1 blob, not 2
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	urlA := mustURL(t, srvA.URL)
+	urlB := mustURL(t, srvB.URL)
+	hA := c.Handler(urlA, nil)
+	hB := c.Handler(urlB, nil)
+
+	hA.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
+	// Sleep so B's lastAccess > A's.
+	time.Sleep(5 * time.Millisecond)
+	hB.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
+
+	if got := c.sizeBytes.Load(); got != 32 {
+		t.Errorf("sizeBytes before eviction: got %d, want 32", got)
+	}
+
+	c.checkEviction()
+
+	c.mu.Lock()
+	_, hasA := c.blobs[blobKey(urlA, `"a"`)]
+	_, hasB := c.blobs[blobKey(urlB, `"b"`)]
+	c.mu.Unlock()
+
+	if hasA {
+		t.Error("expected A (older) to be evicted")
+	}
+	if !hasB {
+		t.Error("expected B (newer) to remain")
+	}
+	if got := c.sizeBytes.Load(); got != 16 {
+		t.Errorf("sizeBytes after eviction: got %d, want 16", got)
+	}
+}
+
+func TestCache_LRUSkipsInFlight(t *testing.T) {
+	body := strings.Repeat("x", 16)
+	srv := fakeUpstream(body, `"e"`, nil)
+	defer srv.Close()
+
+	c, err := NewCache(t.TempDir(), 1, 4<<20) // maxSize 1 → forces eviction of any blob
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	u := mustURL(t, srv.URL)
+	h := c.Handler(u, nil)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
+
+	// Manually pin the blob's refcount.
+	b := c.acquireBlob(blobKey(u, `"e"`))
+	if b == nil {
+		t.Fatal("blob not present")
+	}
+	defer b.release()
+
+	c.checkEviction()
+
+	c.mu.Lock()
+	_, has := c.blobs[blobKey(u, `"e"`)]
+	c.mu.Unlock()
+	if !has {
+		t.Error("in-flight blob should not be evicted")
+	}
+}
+
 func TestStrongETag(t *testing.T) {
 	cases := map[string]string{
 		`"abc"`:   `"abc"`,
