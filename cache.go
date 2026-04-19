@@ -1022,9 +1022,14 @@ func (b *blob) writeChunkFromBytes(idx int, data []byte) error {
 	}
 	tmp := b.chunkPath(idx) + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		os.Remove(tmp) // best-effort cleanup; WriteFile may have created a partial file
 		return err
 	}
-	return os.Rename(tmp, b.chunkPath(idx))
+	if err := os.Rename(tmp, b.chunkPath(idx)); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // writeChunk consumes body fully and writes it atomically to chunk idx.
