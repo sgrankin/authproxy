@@ -528,18 +528,24 @@ func (c *Cache) serveFromBlob(w http.ResponseWriter, r *http.Request, upstream *
 		return
 	}
 
-	// Pre-fetch the first chunk before committing response headers. This way,
-	// fetch failures on the very first chunk surface as a clean 502 rather
-	// than a truncated 200/206 with mismatched Content-Length. Mid-stream
-	// failures on later chunks still result in a truncated body — the Go
-	// http.Client detects this as ErrUnexpectedEOF via the Content-Length
-	// mismatch — but at least the request gets *some* coherent feedback.
+	// Pre-fetch the first chunk before committing response headers so fetch
+	// failures on the very first chunk surface as a clean 502 rather than a
+	// truncated 200/206 with mismatched Content-Length. Mid-stream failures
+	// on later chunks still result in a truncated body — the Go http.Client
+	// detects this as ErrUnexpectedEOF via the Content-Length mismatch — but
+	// at least the request gets *some* coherent feedback.
+	//
+	// Skip for HEAD: metadata was already validated by discover(), and we
+	// won't write a body anyway, so there's no upside to paying a potentially
+	// 4 MiB+ Range fetch just to answer metadata.
 	chunkSize := b.chunkSize
 	firstIdx := int(start / chunkSize)
-	if err := b.ensureChunk(r.Context(), firstIdx, c.fetchChunkFn(upstream, r, headers, b, firstIdx)); err != nil {
-		log.Printf("cache: ensure first chunk %d: %v", firstIdx, err)
-		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
-		return
+	if r.Method != http.MethodHead {
+		if err := b.ensureChunk(r.Context(), firstIdx, c.fetchChunkFn(upstream, r, headers, b, firstIdx)); err != nil {
+			log.Printf("cache: ensure first chunk %d: %v", firstIdx, err)
+			http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
+			return
+		}
 	}
 
 	for k, vs := range b.meta.Header {

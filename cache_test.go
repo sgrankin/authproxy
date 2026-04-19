@@ -353,6 +353,54 @@ func TestCache_LinkedEtagIdentity(t *testing.T) {
 	}
 }
 
+// A HEAD on a warm blob whose first chunk is (simulated) missing should
+// NOT trigger a Range GET — metadata was already validated by discover and
+// HEAD writes no body, so there is no justification for fetching bytes.
+func TestCache_HEADDoesNotPrefetchFirstChunk(t *testing.T) {
+	body := strings.Repeat("h", 4096)
+	const etag = `"head-no-prefetch"`
+	var rangedGets atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
+			rangedGets.Add(1)
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Accept-Ranges", "bytes")
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader(body))
+	}))
+	defer srv.Close()
+
+	c := newCache(t)
+	defer c.Close()
+	u := mustURL(t, srv.URL)
+	h := c.Handler(u, nil, nil)
+
+	// Prime the cache (streaming-fill completes) then simulate chunk 0 being
+	// missing (e.g. partial prior fill or manual eviction).
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/h", nil))
+
+	b := c.acquireBlob(blobKey(u, etag))
+	if b == nil {
+		t.Fatal("blob missing after prime")
+	}
+	b.mu.Lock()
+	b.chunks[0].state = chunkEmpty
+	os.Remove(b.chunkPath(0))
+	b.mu.Unlock()
+	b.release()
+
+	beforeRanged := rangedGets.Load()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("HEAD", "/h", nil))
+	if rec.Code != 200 {
+		t.Fatalf("HEAD code %d", rec.Code)
+	}
+	if delta := rangedGets.Load() - beforeRanged; delta != 0 {
+		t.Errorf("HEAD triggered %d ranged GET(s); want 0", delta)
+	}
+}
+
 func TestHasUncacheableVary(t *testing.T) {
 	cases := map[string]bool{
 		"":                              false,
