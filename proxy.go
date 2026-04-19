@@ -30,10 +30,10 @@ func NewService(cfg ServiceConfig, stateDir string, cache *Cache, chunks *chunkC
 			Dir:      filepath.Join(stateDir, cfg.Hostname),
 			Logf:     func(string, ...any) {},
 		},
-		chunks: chunks,
 	}
 	if cfg.Cache {
 		s.cache = cache
+		s.chunks = chunks
 	}
 	return s
 }
@@ -41,9 +41,10 @@ func NewService(cfg ServiceConfig, stateDir string, cache *Cache, chunks *chunkC
 // NewLocalService binds the service to a plain localhost addr instead of tsnet.
 // `listen` config is ignored — local always serves plain HTTP on the given addr.
 func NewLocalService(cfg ServiceConfig, addr string, cache *Cache, chunks *chunkCache) *Service {
-	s := &Service{cfg: cfg, localAddr: addr, chunks: chunks}
+	s := &Service{cfg: cfg, localAddr: addr}
 	if cfg.Cache {
 		s.cache = cache
+		s.chunks = chunks
 	}
 	return s
 }
