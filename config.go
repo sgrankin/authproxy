@@ -41,6 +41,9 @@ type Header struct {
 func LoadConfig(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
+		if abs, aerr := filepath.Abs(path); aerr == nil && abs != path {
+			return nil, fmt.Errorf("%w (resolved to %s)", err, abs)
+		}
 		return nil, err
 	}
 	defer f.Close()
