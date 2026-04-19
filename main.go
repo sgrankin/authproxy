@@ -33,16 +33,18 @@ func main() {
 	if err := os.MkdirAll(cfg.Cache.Dir, 0o700); err != nil {
 		log.Fatalf("mkdir cache: %v", err)
 	}
-	cache, err := NewCache(cfg.Cache.Dir, cfg.Cache.MaxSize, cfg.Cache.ChunkSize)
+	// Shared LRU budget across both caches. Eviction picks the globally
+	// oldest entry regardless of which layer owns it.
+	lru := NewDiskLRU(cfg.Cache.MaxSize)
+
+	cache, err := NewCache(cfg.Cache.Dir, cfg.Cache.ChunkSize, lru)
 	if err != nil {
 		log.Fatalf("cache: %v", err)
 	}
 
-	// Chunk cache (shared across all services) for xet content-addressable
-	// storage. Lives under the main cache dir so both caches share a single
-	// on-disk root the user configured. Shares the same max-size budget
-	// (independent eviction; worst-case disk use is 2×max-size).
-	chunks, err := newChunkCache(filepath.Join(cfg.Cache.Dir, "xet-chunks"), cfg.Cache.MaxSize)
+	// Chunk cache (xet) lives under the main cache dir so both layers
+	// share the single on-disk root the user configured.
+	chunks, err := newChunkCache(filepath.Join(cfg.Cache.Dir, "xet-chunks"), lru)
 	if err != nil {
 		log.Fatalf("chunk cache: %v", err)
 	}
@@ -72,6 +74,7 @@ func main() {
 	}
 	cache.Close()
 	chunks.Close()
+	lru.Close()
 }
 
 func defaultStateDir() (string, error) {

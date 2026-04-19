@@ -18,6 +18,15 @@ via per-chunk singleflight. New blobs additionally trigger a streaming-tee
 fill (one big GET, sliced into chunks as bytes arrive). Per-blob refcount
 gates LRU eviction — in-use blobs never get evicted.
 
+### Shared LRU budget
+
+Both the blob `Cache` and the xet `chunkCache` register as "kinds" on a
+single `DiskLRU` (see `disklru.go`). The LRU maintains one access-time-
+ordered pool across all entries and evicts the globally-oldest first,
+regardless of which layer owns it — so a stale xet chunk can make room
+for a hot HTTP blob, and vice versa. Combined disk usage stays under
+`cache.max-size`, not 2× that.
+
 **Freshness model:** every request issues a HEAD with `If-None-Match` to
 revalidate. We do **not** honor `Cache-Control: max-age` — always check
 upstream. Trade one round-trip for correctness; revisit if HEAD overhead

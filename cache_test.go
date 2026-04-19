@@ -17,7 +17,9 @@ import (
 
 func newCache(t *testing.T) *Cache {
 	t.Helper()
-	c, err := NewCache(t.TempDir(), 100<<20, 4<<20) // 4 MiB chunks
+	lru := NewDiskLRU(100 << 20)
+	t.Cleanup(lru.Close)
+	c, err := NewCache(t.TempDir(), 4<<20, lru) // 4 MiB chunks
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +628,9 @@ func TestCache_LRUEviction(t *testing.T) {
 	srvB := fakeUpstream(body, `"b"`, nil)
 	defer srvB.Close()
 
-	c, err := NewCache(t.TempDir(), 24, 4<<20) // maxSize 24 → fits 1 blob, not 2
+	lru := NewDiskLRU(24) // maxSize 24 → fits 1 blob, not 2
+	defer lru.Close()
+	c, err := NewCache(t.TempDir(), 4<<20, lru)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,11 +646,11 @@ func TestCache_LRUEviction(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 	hB.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
 
-	if got := c.sizeBytes.Load(); got != 32 {
-		t.Errorf("sizeBytes before eviction: got %d, want 32", got)
+	if got := lru.Size(); got != 32 {
+		t.Errorf("lru.Size before eviction: got %d, want 32", got)
 	}
 
-	c.checkEviction()
+	lru.checkEviction()
 
 	c.mu.Lock()
 	_, hasA := c.blobs[blobKey(urlA, `"a"`)]
@@ -659,8 +663,8 @@ func TestCache_LRUEviction(t *testing.T) {
 	if !hasB {
 		t.Error("expected B (newer) to remain")
 	}
-	if got := c.sizeBytes.Load(); got != 16 {
-		t.Errorf("sizeBytes after eviction: got %d, want 16", got)
+	if got := lru.Size(); got != 16 {
+		t.Errorf("lru.Size after eviction: got %d, want 16", got)
 	}
 }
 
@@ -669,7 +673,9 @@ func TestCache_LRUSkipsInFlight(t *testing.T) {
 	srv := fakeUpstream(body, `"e"`, nil)
 	defer srv.Close()
 
-	c, err := NewCache(t.TempDir(), 1, 4<<20) // maxSize 1 → forces eviction of any blob
+	lru := NewDiskLRU(1) // maxSize 1 → forces eviction of any blob
+	defer lru.Close()
+	c, err := NewCache(t.TempDir(), 4<<20, lru)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,7 +692,7 @@ func TestCache_LRUSkipsInFlight(t *testing.T) {
 	}
 	defer b.release()
 
-	c.checkEviction()
+	lru.checkEviction()
 
 	c.mu.Lock()
 	_, has := c.blobs[blobKey(u, `"e"`)]
@@ -706,7 +712,8 @@ func TestCache_EtagPersistence(t *testing.T) {
 	dir := t.TempDir()
 
 	// First run: populate cache.
-	c1, err := NewCache(dir, 100<<20, 4<<20)
+	lru1 := NewDiskLRU(100 << 20)
+	c1, err := NewCache(dir, 4<<20, lru1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,6 +723,7 @@ func TestCache_EtagPersistence(t *testing.T) {
 	if err := c1.Close(); err != nil {
 		t.Fatal(err)
 	}
+	lru1.Close()
 
 	// Verify the etag file was written.
 	if _, err := os.Stat(filepath.Join(dir, "etags.json")); err != nil {
@@ -723,7 +731,9 @@ func TestCache_EtagPersistence(t *testing.T) {
 	}
 
 	// Second run: should load etags from disk.
-	c2, err := NewCache(dir, 100<<20, 4<<20)
+	lru2 := NewDiskLRU(100 << 20)
+	defer lru2.Close()
+	c2, err := NewCache(dir, 4<<20, lru2)
 	if err != nil {
 		t.Fatal(err)
 	}

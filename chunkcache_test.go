@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -53,7 +54,7 @@ func TestChunkCache_HitSkipsUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cc, err := newChunkCache(t.TempDir(), 0)
+	cc, err := newChunkCache(t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +106,7 @@ func TestChunkCache_SingleflightDedup(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cc, err := newChunkCache(t.TempDir(), 0)
+	cc, err := newChunkCache(t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +133,8 @@ func TestChunkCache_SingleflightDedup(t *testing.T) {
 	}
 }
 
-// checkEviction should remove oldest-accessed entries once sizeBytes goes
-// over the max.
+// When chunkCache shares a DiskLRU, a DiskLRU.checkEviction call should
+// trim its oldest entries until the global budget fits.
 func TestChunkCache_LRUEvicts(t *testing.T) {
 	body := "0123456789" // 10 bytes per chunk
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -143,15 +144,15 @@ func TestChunkCache_LRUEvicts(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	dir := t.TempDir()
 	// Each stored entry is the HTTP wire format of the response (~80 bytes
 	// for our tiny body). Budget fits 2 entries, forcing 1 eviction after
 	// the 3rd arrives.
-	cc, err := newChunkCache(dir, 200)
+	lru := NewDiskLRU(200)
+	defer lru.Close()
+	cc, err := newChunkCache(t.TempDir(), lru)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cc.Close()
 
 	fetch := func() (*http.Response, error) {
 		req, _ := http.NewRequest("GET", upstream.URL, nil)
@@ -164,22 +165,18 @@ func TestChunkCache_LRUEvicts(t *testing.T) {
 		cc.serve(rec, httptest.NewRequest("GET", "/x", nil), k, fetch)
 		time.Sleep(2 * time.Millisecond)
 	}
-	// A's lastAccess is oldest; checkEviction should drop it first.
-	before := cc.sizeBytes.Load()
-	cc.checkEviction()
-	after := cc.sizeBytes.Load()
+	before := lru.Size()
+	lru.checkEviction()
+	after := lru.Size()
 	if after >= before {
-		t.Errorf("sizeBytes unchanged: %d -> %d (expected shrink under maxSize)", before, after)
+		t.Errorf("lru.Size unchanged: %d -> %d (expected shrink under maxSize)", before, after)
 	}
-	cc.mu.Lock()
-	_, hasA := cc.entries["ka"]
-	_, hasC := cc.entries["kc"]
-	cc.mu.Unlock()
-	if hasA {
-		t.Error("expected ka (oldest) to be evicted")
+	// ka is oldest; it should be gone while kc survives.
+	if _, err := os.Stat(cc.path("ka")); !os.IsNotExist(err) {
+		t.Errorf("expected ka (oldest) to be evicted, stat err = %v", err)
 	}
-	if !hasC {
-		t.Error("expected kc (newest) to survive")
+	if _, err := os.Stat(cc.path("kc")); err != nil {
+		t.Errorf("expected kc (newest) to survive, stat err = %v", err)
 	}
 }
 
@@ -193,7 +190,7 @@ func TestChunkCache_NonSuccessNotCached(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cc, err := newChunkCache(t.TempDir(), 0)
+	cc, err := newChunkCache(t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

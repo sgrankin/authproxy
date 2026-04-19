@@ -26,7 +26,7 @@ import (
 type Cache struct {
 	dir        string
 	chunkSize  int64
-	maxSize    int64
+	lru        *DiskLRU
 	client     *http.Client // follows redirects (for body GETs)
 	headClient *http.Client // returns the first response (for discover HEADs)
 
@@ -34,21 +34,20 @@ type Cache struct {
 	blobs map[string]*blob  // blobKey → blob
 	etags map[string]string // requestKey → last-known strong ETag
 
-	sizeBytes atomic.Int64 // sum of bytes across all complete chunks of all blobs
-
 	closeOnce sync.Once
 	closeCh   chan struct{}
 	wg        sync.WaitGroup
 }
 
 const (
-	evictionInterval  = time.Minute
+	diskLRUKindBlob   = "blob"
 	etagFlushInterval = 30 * time.Second
 	etagsFile         = "etags.json"
 )
 
-// NewCache opens (or creates) a cache rooted at dir.
-func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
+// NewCache opens (or creates) a cache rooted at dir. The returned Cache
+// registers itself with lru so global eviction can reclaim stale blobs.
+func NewCache(dir string, chunkSize int64, lru *DiskLRU) (*Cache, error) {
 	if chunkSize <= 0 {
 		return nil, fmt.Errorf("chunk size must be positive")
 	}
@@ -61,7 +60,7 @@ func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
 	c := &Cache{
 		dir:       dir,
 		chunkSize: chunkSize,
-		maxSize:   maxSize,
+		lru:       lru,
 		blobs:     map[string]*blob{},
 		etags:     map[string]string{},
 		closeCh:   make(chan struct{}),
@@ -77,17 +76,39 @@ func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
 			},
 		},
 	}
+	lru.Register(diskLRUKindBlob, (*cacheKind)(c))
 	if err := c.load(); err != nil {
 		return nil, err
 	}
 	c.loadEtags()
-	if maxSize > 0 {
-		c.wg.Add(1)
-		go c.evictLoop()
-	}
 	c.wg.Add(1)
 	go c.etagFlushLoop()
 	return c, nil
+}
+
+// cacheKind is a typed alias on Cache used solely to implement DiskKind
+// without colliding the method name with anything else on Cache.
+type cacheKind Cache
+
+// Evict releases the blob for key if it's not currently in use. Returns
+// ok=false to skip when refcount > 0; DiskLRU retries on the next tick.
+func (ck *cacheKind) Evict(key string) bool {
+	c := (*Cache)(ck)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, ok := c.blobs[key]
+	if !ok {
+		return true // already gone; let DiskLRU clear its tracking
+	}
+	if b.inFlight.Load() > 0 {
+		return false
+	}
+	delete(c.blobs, key)
+	if err := os.RemoveAll(b.dir); err != nil {
+		log.Printf("cache: evict %s: %v", key, err)
+		// Keep the map entry removed; disk cleanup can be retried manually.
+	}
+	return true
 }
 
 // Close stops background goroutines and flushes the etag map. Safe to call
@@ -101,20 +122,6 @@ func (c *Cache) Close() error {
 	c.wg.Wait()
 	c.flushEtags() // final flush after background loop has stopped
 	return nil
-}
-
-func (c *Cache) evictLoop() {
-	defer c.wg.Done()
-	t := time.NewTicker(evictionInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-c.closeCh:
-			return
-		case <-t.C:
-			c.checkEviction()
-		}
-	}
 }
 
 func (c *Cache) etagFlushLoop() {
@@ -180,52 +187,6 @@ func (c *Cache) flushEtags() {
 	path := filepath.Join(c.dir, etagsFile)
 	if err := writeJSONAtomic(path, snap); err != nil {
 		log.Printf("cache: flush %s: %v", etagsFile, err)
-	}
-}
-
-// checkEviction removes least-recently-accessed blobs until total size is
-// under maxSize. Blobs with active reads/fills (inFlight > 0) are skipped.
-func (c *Cache) checkEviction() {
-	if c.sizeBytes.Load() <= c.maxSize {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	type cand struct {
-		b  *blob
-		ts int64
-	}
-	cands := make([]cand, 0, len(c.blobs))
-	for _, b := range c.blobs {
-		if b.inFlight.Load() == 0 {
-			cands = append(cands, cand{b, b.lastAccess.Load()})
-		}
-	}
-	// Sort by lastAccess ascending (oldest first). Small N expected; bubble-style sort is fine.
-	for i := 1; i < len(cands); i++ {
-		for j := i; j > 0 && cands[j-1].ts > cands[j].ts; j-- {
-			cands[j-1], cands[j] = cands[j], cands[j-1]
-		}
-	}
-	for _, cd := range cands {
-		if c.sizeBytes.Load() <= c.maxSize {
-			break
-		}
-		b := cd.b
-		// Re-check refcount under cache lock — eviction holds c.mu, and
-		// acquireBlob bumps refcount under c.mu, so this is race-free.
-		if b.inFlight.Load() > 0 {
-			continue
-		}
-		delete(c.blobs, b.key)
-		freed := b.bytes.Load()
-		if err := os.RemoveAll(b.dir); err != nil {
-			log.Printf("cache: evict %s: %v", b.key, err)
-			continue
-		}
-		c.sizeBytes.Add(-freed)
-		log.Printf("cache: evicted %s (%d bytes)", b.key, freed)
 	}
 }
 
@@ -508,8 +469,15 @@ func (c *Cache) getOrCreateBlob(upstream *url.URL, etag string, meta blobMeta) (
 		chunkSize: meta.ChunkSize,
 		cache:     c,
 	}
+	// Admit before init so chunkCompleted inside init can Grow.
+	if c.lru != nil {
+		c.lru.Admit(diskLRUKindBlob, key, 0)
+	}
 	if err := b.init(); err != nil {
 		log.Printf("cache: blob init %s: %v", key, err)
+		if c.lru != nil {
+			c.lru.Forget(diskLRUKindBlob, key)
+		}
 		return nil, false
 	}
 	c.blobs[key] = b
@@ -901,13 +869,11 @@ type blob struct {
 	dir       string
 	meta      blobMeta
 	chunkSize int64
-	cache     *Cache // back-ref for size accounting
+	cache     *Cache // back-ref for LRU bookkeeping (lru.Grow, lru.Touch)
 
-	mu         sync.Mutex
-	chunks     []chunkSlot
-	lastAccess atomic.Int64
-	inFlight   atomic.Int32 // active reads/fills; eviction skips while >0
-	bytes      atomic.Int64 // sum of complete chunk file sizes
+	mu       sync.Mutex
+	chunks   []chunkSlot
+	inFlight atomic.Int32 // active reads/fills; eviction skips while >0
 }
 
 func (b *blob) acquire() { b.inFlight.Add(1) }
@@ -917,9 +883,8 @@ func (b *blob) release() { b.inFlight.Add(-1) }
 // once per chunk transitioning from empty to complete.
 func (b *blob) chunkCompleted(idx int) {
 	size := b.expectedChunkSize(idx)
-	b.bytes.Add(size)
-	if b.cache != nil {
-		b.cache.sizeBytes.Add(size)
+	if b.cache != nil && b.cache.lru != nil {
+		b.cache.lru.Grow(diskLRUKindBlob, b.key, size)
 	}
 }
 
@@ -974,6 +939,10 @@ func loadBlob(dir string, cache *Cache) (*blob, error) {
 		chunkSize: meta.ChunkSize,
 		cache:     cache,
 	}
+	// Admit before counting chunks so chunkCompleted's Grow calls take effect.
+	if cache != nil && cache.lru != nil {
+		cache.lru.Admit(diskLRUKindBlob, b.key, 0)
+	}
 	n := chunkCount(meta.ContentLength, meta.ChunkSize)
 	b.chunks = make([]chunkSlot, n)
 	for i := range b.chunks {
@@ -986,7 +955,9 @@ func loadBlob(dir string, cache *Cache) (*blob, error) {
 }
 
 func (b *blob) touch() {
-	b.lastAccess.Store(timeNowUnixNano())
+	if b.cache != nil && b.cache.lru != nil {
+		b.cache.lru.Touch(diskLRUKindBlob, b.key)
+	}
 }
 
 func (b *blob) chunkPath(idx int) string {
@@ -1244,8 +1215,4 @@ func writeJSONAtomic(path string, v any) error {
 		return err
 	}
 	return os.Rename(tmp, path)
-}
-
-func timeNowUnixNano() int64 {
-	return time.Now().UnixNano()
 }
