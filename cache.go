@@ -81,7 +81,9 @@ func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
 }
 
 // Close stops background goroutines and flushes the etag map. Safe to call
-// multiple times.
+// multiple times. Callers should shut down any HTTP servers using this Cache
+// first; in-flight requests that mutate c.etags after Close are silently
+// dropped (no panic, but their work is lost).
 func (c *Cache) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeCh)
@@ -148,7 +150,10 @@ func (c *Cache) loadEtags() {
 }
 
 // flushEtags writes the current URL→ETag map to disk, omitting entries whose
-// blob is no longer present.
+// blob is no longer present. The snapshot/write is intentionally lossy:
+// entries added between the c.mu.Unlock and the disk write are not in the
+// persisted file but remain in memory until the next flush. Acceptable since
+// missing an etag entry just costs one full fetch on cold start.
 func (c *Cache) flushEtags() {
 	c.mu.Lock()
 	snap := make(map[string]string, len(c.etags))
@@ -226,7 +231,13 @@ func (c *Cache) load() error {
 		blobDir := filepath.Join(c.dir, e.Name())
 		b, err := loadBlob(blobDir, c)
 		if err != nil {
-			log.Printf("cache: skipping %s: %v", e.Name(), err)
+			// Failed-to-load blob dirs are unrecoverable (corrupt meta,
+			// missing files, etc.) and don't contribute to sizeBytes — so
+			// LRU eviction can't reclaim them. Reap on startup.
+			log.Printf("cache: removing unloadable blob dir %s: %v", e.Name(), err)
+			if rerr := os.RemoveAll(blobDir); rerr != nil {
+				log.Printf("cache: remove %s: %v", e.Name(), rerr)
+			}
 			continue
 		}
 		c.blobs[e.Name()] = b
