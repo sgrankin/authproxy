@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/sblinch/kdl-go"
-	"github.com/sblinch/kdl-go/document"
 )
 
 type Config struct {
@@ -38,6 +37,28 @@ type Header struct {
 	Name, Value string
 }
 
+// raw* mirror the on-disk KDL shape; the public Config is produced after
+// validation, size parsing, env interpolation, and URL parsing.
+type rawConfig struct {
+	Cache    rawCache     `kdl:"cache"`
+	Services []rawService `kdl:"service,multiple"`
+}
+
+type rawCache struct {
+	Dir       string `kdl:"dir"`
+	MaxSize   string `kdl:"max-size"`
+	ChunkSize string `kdl:"chunk-size"`
+}
+
+type rawService struct {
+	Name     string            `kdl:",arg"`
+	Hostname string            `kdl:"hostname"`
+	Upstream string            `kdl:"upstream"`
+	Cache    bool              `kdl:"cache"`
+	Listen   []string          `kdl:"listen"`
+	Headers  map[string]string `kdl:"header,multiple"`
+}
+
 func LoadConfig(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -51,10 +72,15 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func ParseConfig(r io.Reader) (*Config, error) {
-	doc, err := kdl.Parse(r)
+	data, err := io.ReadAll(r)
 	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	var raw rawConfig
+	if err := kdl.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse kdl: %w", err)
 	}
+
 	c := &Config{
 		Cache: CacheConfig{
 			Dir:       "~/.cache/authproxy",
@@ -62,174 +88,89 @@ func ParseConfig(r io.Reader) (*Config, error) {
 			ChunkSize: 4 << 20,   // 4 MiB
 		},
 	}
-	for _, n := range doc.Nodes {
-		switch nodeName(n) {
-		case "cache":
-			if err := parseCacheBlock(n, &c.Cache); err != nil {
-				return nil, err
-			}
-		case "service":
-			s, err := parseServiceBlock(n)
-			if err != nil {
-				return nil, err
-			}
-			c.Services = append(c.Services, s)
-		default:
-			return nil, fmt.Errorf("unknown top-level node %q", nodeName(n))
-		}
+	if raw.Cache.Dir != "" {
+		c.Cache.Dir = raw.Cache.Dir
 	}
-
+	if raw.Cache.MaxSize != "" {
+		n, err := parseSize(raw.Cache.MaxSize)
+		if err != nil {
+			return nil, fmt.Errorf("cache.max-size: %w", err)
+		}
+		c.Cache.MaxSize = n
+	}
+	if raw.Cache.ChunkSize != "" {
+		n, err := parseSize(raw.Cache.ChunkSize)
+		if err != nil {
+			return nil, fmt.Errorf("cache.chunk-size: %w", err)
+		}
+		c.Cache.ChunkSize = n
+	}
 	c.Cache.Dir = expandHome(c.Cache.Dir)
-	if len(c.Services) == 0 {
+
+	if len(raw.Services) == 0 {
 		return nil, fmt.Errorf("no services configured")
 	}
-	seen := map[string]bool{}
-	for _, s := range c.Services {
-		if seen[s.Hostname] {
+	seenHost := map[string]bool{}
+	for _, rs := range raw.Services {
+		s, err := buildService(rs)
+		if err != nil {
+			return nil, err
+		}
+		if seenHost[s.Hostname] {
 			return nil, fmt.Errorf("duplicate hostname %q", s.Hostname)
 		}
-		seen[s.Hostname] = true
+		seenHost[s.Hostname] = true
+		c.Services = append(c.Services, s)
 	}
 	return c, nil
 }
 
-func parseCacheBlock(n *document.Node, out *CacheConfig) error {
-	for _, child := range n.Children {
-		v, err := stringArg(child, 0)
-		if err != nil {
-			return fmt.Errorf("cache.%s: %w", nodeName(child), err)
-		}
-		switch nodeName(child) {
-		case "dir":
-			out.Dir = v
-		case "max-size":
-			n, err := parseSize(v)
-			if err != nil {
-				return fmt.Errorf("cache.max-size: %w", err)
-			}
-			out.MaxSize = n
-		case "chunk-size":
-			n, err := parseSize(v)
-			if err != nil {
-				return fmt.Errorf("cache.chunk-size: %w", err)
-			}
-			out.ChunkSize = n
-		default:
-			return fmt.Errorf("cache: unknown key %q", nodeName(child))
-		}
+func buildService(rs rawService) (ServiceConfig, error) {
+	s := ServiceConfig{
+		Name:     rs.Name,
+		Hostname: rs.Hostname,
+		Cache:    rs.Cache,
+		Listen:   rs.Listen,
 	}
-	return nil
-}
-
-func parseServiceBlock(n *document.Node) (ServiceConfig, error) {
-	s := ServiceConfig{}
-	name, err := stringArg(n, 0)
-	if err != nil {
-		return s, fmt.Errorf("service: %w", err)
+	if s.Name == "" {
+		return s, fmt.Errorf("service: missing name argument")
 	}
-	s.Name = name
-
-	for _, child := range n.Children {
-		switch nodeName(child) {
-		case "hostname":
-			s.Hostname, err = stringArg(child, 0)
-		case "upstream":
-			raw, e := stringArg(child, 0)
-			if e != nil {
-				err = e
-				break
-			}
-			s.Upstream, err = url.Parse(raw)
-			if err == nil && (s.Upstream.Scheme == "" || s.Upstream.Host == "") {
-				err = fmt.Errorf("upstream %q missing scheme or host", raw)
-			}
-		case "cache":
-			s.Cache, err = boolArg(child, 0)
-		case "listen":
-			for i := range child.Arguments {
-				v, e := stringArg(child, i)
-				if e != nil {
-					err = e
-					break
-				}
-				if v != "http" && v != "https" {
-					err = fmt.Errorf("listen: must be \"http\" or \"https\", got %q", v)
-					break
-				}
-				s.Listen = append(s.Listen, v)
-			}
-		case "header":
-			hname, e := stringArg(child, 0)
-			if e != nil {
-				err = e
-				break
-			}
-			hval, e := stringArg(child, 1)
-			if e != nil {
-				err = e
-				break
-			}
-			hval, err = interpolateEnv(hval)
-			if err == nil {
-				s.Headers = append(s.Headers, Header{Name: hname, Value: hval})
-			}
-		default:
-			err = fmt.Errorf("unknown key %q", nodeName(child))
-		}
-		if err != nil {
-			return s, fmt.Errorf("service %q: %w", s.Name, err)
-		}
-	}
-
 	if s.Hostname == "" {
 		return s, fmt.Errorf("service %q: missing hostname", s.Name)
 	}
-	if s.Upstream == nil {
+	if rs.Upstream == "" {
 		return s, fmt.Errorf("service %q: missing upstream", s.Name)
+	}
+	u, err := url.Parse(rs.Upstream)
+	if err != nil {
+		return s, fmt.Errorf("service %q: upstream: %w", s.Name, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return s, fmt.Errorf("service %q: upstream %q missing scheme or host", s.Name, rs.Upstream)
+	}
+	s.Upstream = u
+	for _, sch := range s.Listen {
+		if sch != "http" && sch != "https" {
+			return s, fmt.Errorf("service %q: listen: must be \"http\" or \"https\", got %q", s.Name, sch)
+		}
 	}
 	if len(s.Listen) == 0 {
 		s.Listen = []string{"https"}
 	}
-	return s, nil
-}
-
-func nodeName(n *document.Node) string {
-	if n.Name == nil {
-		return ""
-	}
-	if s, ok := n.Name.Value.(string); ok {
-		return s
-	}
-	return ""
-}
-
-func stringArg(n *document.Node, i int) (string, error) {
-	if i >= len(n.Arguments) {
-		return "", fmt.Errorf("missing argument %d", i)
-	}
-	v := n.Arguments[i].Value
-	s, ok := v.(string)
-	if !ok {
-		return "", fmt.Errorf("argument %d: want string, got %T", i, v)
+	for hname, hval := range rs.Headers {
+		v, err := interpolateEnv(hval)
+		if err != nil {
+			return s, fmt.Errorf("service %q: header %q: %w", s.Name, hname, err)
+		}
+		s.Headers = append(s.Headers, Header{Name: hname, Value: v})
 	}
 	return s, nil
-}
-
-func boolArg(n *document.Node, i int) (bool, error) {
-	if i >= len(n.Arguments) {
-		return false, fmt.Errorf("missing argument %d", i)
-	}
-	b, ok := n.Arguments[i].Value.(bool)
-	if !ok {
-		return false, fmt.Errorf("argument %d: want bool, got %T", i, n.Arguments[i].Value)
-	}
-	return b, nil
 }
 
 var sizeUnits = map[string]int64{
-	"":    1,
-	"b":   1,
-	"k":   1 << 10, "kb": 1 << 10, "kib": 1 << 10,
+	"":  1,
+	"b": 1,
+	"k": 1 << 10, "kb": 1 << 10, "kib": 1 << 10,
 	"m": 1 << 20, "mb": 1 << 20, "mib": 1 << 20,
 	"g": 1 << 30, "gb": 1 << 30, "gib": 1 << 30,
 	"t": 1 << 40, "tb": 1 << 40, "tib": 1 << 40,
