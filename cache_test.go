@@ -229,6 +229,76 @@ func TestCache_BlockResponseHeaders(t *testing.T) {
 	}
 }
 
+// Simulates HF's shape: the origin HEAD returns a 302 with the file metadata
+// (X-Repo-Commit, X-Linked-Etag, X-Linked-Size) and a Location pointing at a
+// CDN. The CDN's HEAD returns 200 with the actual size, content-type, and
+// ETag. The proxy should merge and expose all of them to clients.
+func TestCache_DiscoverFollowsRedirectAndMergesHeaders(t *testing.T) {
+	body := strings.Repeat("m", 4096)
+	const cdnETag = `"cdn-v1"`
+
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", cdnETag)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader(body))
+	}))
+	defer cdn.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Location", cdn.URL+r.URL.Path)
+			w.Header().Set("X-Repo-Commit", "deadbeefcommit")
+			w.Header().Set("X-Linked-Etag", `"linked-v1"`)
+			w.Header().Set("X-Linked-Size", strconv.Itoa(len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		// Non-HEAD: redirect as usual (for body fetches).
+		http.Redirect(w, r, cdn.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer origin.Close()
+
+	c := newCache(t)
+	defer c.Close()
+	h := c.Handler(mustURL(t, origin.URL), nil, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("HEAD", "/m", nil))
+	if rec.Code != 200 {
+		t.Fatalf("HEAD: code %d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Repo-Commit"); got != "deadbeefcommit" {
+		t.Errorf("X-Repo-Commit: %q", got)
+	}
+	if got := rec.Header().Get("X-Linked-Etag"); got != `"linked-v1"` {
+		t.Errorf("X-Linked-Etag: %q", got)
+	}
+	if got := rec.Header().Get("X-Linked-Size"); got != strconv.Itoa(len(body)) {
+		t.Errorf("X-Linked-Size: %q", got)
+	}
+	if got := rec.Header().Get("ETag"); got != cdnETag {
+		t.Errorf("ETag: %q want %q", got, cdnETag)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("Content-Type: %q", got)
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Errorf("Location should be stripped, got %q", got)
+	}
+
+	// GET: body still flows through (ReverseProxy follows on body fetches).
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("GET", "/m", nil))
+	if rec2.Code != 200 {
+		t.Fatalf("GET: code %d", rec2.Code)
+	}
+	if rec2.Body.Len() != len(body) {
+		t.Fatalf("GET body len %d, want %d", rec2.Body.Len(), len(body))
+	}
+}
+
 func TestHasUncacheableVary(t *testing.T) {
 	cases := map[string]bool{
 		"":                              false,

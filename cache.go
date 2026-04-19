@@ -24,10 +24,11 @@ import (
 // on demand via Range requests against the upstream, and concurrent requests
 // for the same chunk are deduplicated via per-chunk singleflight.
 type Cache struct {
-	dir       string
-	chunkSize int64
-	maxSize   int64
-	client    *http.Client
+	dir        string
+	chunkSize  int64
+	maxSize    int64
+	client     *http.Client // follows redirects (for body GETs)
+	headClient *http.Client // returns the first response (for discover HEADs)
 
 	mu    sync.Mutex
 	blobs map[string]*blob  // blobKey → blob
@@ -54,6 +55,9 @@ func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("cache mkdir: %w", err)
 	}
+	transport := &http.Transport{
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
 	c := &Cache{
 		dir:       dir,
 		chunkSize: chunkSize,
@@ -61,9 +65,15 @@ func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
 		blobs:     map[string]*blob{},
 		etags:     map[string]string{},
 		closeCh:   make(chan struct{}),
-		client: &http.Client{
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: 30 * time.Second,
+		client:    &http.Client{Transport: transport},
+		headClient: &http.Client{
+			Transport: transport,
+			// discover() needs to see each upstream response as-is — following
+			// 3xx would swallow HF's HEAD-time headers (X-Repo-Commit,
+			// X-Linked-Etag, …) that live on the redirect, not the final CDN
+			// 200. discover handles redirects manually.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
 			},
 		},
 	}
@@ -359,9 +369,15 @@ func (c *Cache) fetchFullFn(upstream *url.URL, r *http.Request, headers []Header
 	}
 }
 
-// discover issues a HEAD against the upstream (following redirects). If
-// knownETag is non-empty it's sent as If-None-Match; on 304 the function
-// returns etag = knownETag and meta from the original cached entry.
+// discover issues a HEAD against the upstream without auto-following
+// redirects. If knownETag is non-empty it's sent as If-None-Match; on 304 the
+// function returns etag = knownETag and meta from the original cached entry.
+//
+// On a 3xx response, discover issues a second HEAD against the Location
+// (following further redirects) to get the final resource's ETag / size /
+// content-type. Headers from the initial response are merged so HF-specific
+// metadata (X-Repo-Commit, X-Linked-Etag, X-Linked-Size, X-Xet-*) that lives
+// on the redirect survives for the client.
 func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request, headers []Header, block []string, knownETag string) (etag string, meta blobMeta, supportsRange bool, err error) {
 	out, err := buildOutbound(ctx, http.MethodHead, r, upstream, headers)
 	if err != nil {
@@ -370,17 +386,17 @@ func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request
 	if knownETag != "" {
 		out.Header.Set("If-None-Match", knownETag)
 	}
-	resp, err := c.client.Do(out)
+	resp, err := c.headClient.Do(out)
 	if err != nil {
 		return "", blobMeta{}, false, err
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body) // tiny
 
-	switch resp.StatusCode {
-	case http.StatusNotModified:
+	switch {
+	case resp.StatusCode == http.StatusNotModified:
 		return knownETag, blobMeta{}, true, nil
-	case http.StatusOK:
+	case resp.StatusCode == http.StatusOK:
 		etag = strongETag(resp.Header.Get("ETag"))
 		supportsRange = strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes")
 		meta = blobMeta{
@@ -389,6 +405,50 @@ func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request
 			ContentType:   resp.Header.Get("Content-Type"),
 			ContentLength: resp.ContentLength,
 			Header:        filterResponseHeaders(resp.Header, block),
+			ChunkSize:     c.chunkSize,
+		}
+		return etag, meta, supportsRange, nil
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			return "", blobMeta{}, false, fmt.Errorf("upstream HEAD %d without Location", resp.StatusCode)
+		}
+		absLoc, err := out.URL.Parse(loc)
+		if err != nil {
+			return "", blobMeta{}, false, fmt.Errorf("parse Location %q: %w", loc, err)
+		}
+		follow, err := http.NewRequestWithContext(ctx, http.MethodHead, absLoc.String(), nil)
+		if err != nil {
+			return "", blobMeta{}, false, err
+		}
+		followResp, err := c.client.Do(follow)
+		if err != nil {
+			return "", blobMeta{}, false, err
+		}
+		defer followResp.Body.Close()
+		io.Copy(io.Discard, followResp.Body)
+		if followResp.StatusCode != http.StatusOK {
+			return "", blobMeta{}, false, fmt.Errorf("upstream HEAD after redirect: %d", followResp.StatusCode)
+		}
+		// Merge: start from origin's redirect headers (HF metadata), overlay
+		// final response headers (CDN size/type/etag). Strip Location — we
+		// always serve 200 from cache, Location is not meaningful downstream.
+		merged := http.Header{}
+		for k, vs := range resp.Header {
+			merged[k] = append([]string{}, vs...)
+		}
+		for k, vs := range followResp.Header {
+			merged[k] = append([]string{}, vs...)
+		}
+		merged.Del("Location")
+		etag = strongETag(followResp.Header.Get("ETag"))
+		supportsRange = strings.EqualFold(followResp.Header.Get("Accept-Ranges"), "bytes")
+		meta = blobMeta{
+			ETag:          etag,
+			StatusCode:    http.StatusOK,
+			ContentType:   followResp.Header.Get("Content-Type"),
+			ContentLength: followResp.ContentLength,
+			Header:        filterResponseHeaders(merged, block),
 			ChunkSize:     c.chunkSize,
 		}
 		return etag, meta, supportsRange, nil
