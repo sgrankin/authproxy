@@ -520,9 +520,7 @@ func TestCache_ConcurrentRequestsShareFill(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 3 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest("GET", "/y", nil))
 			if rec.Code != 200 {
@@ -531,7 +529,7 @@ func TestCache_ConcurrentRequestsShareFill(t *testing.T) {
 			if rec.Body.Len() != len(body) {
 				t.Errorf("body len %d, want %d", rec.Body.Len(), len(body))
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

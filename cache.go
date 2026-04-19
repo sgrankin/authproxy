@@ -81,8 +81,7 @@ func NewCache(dir string, chunkSize int64, lru *DiskLRU) (*Cache, error) {
 		return nil, err
 	}
 	c.loadEtags()
-	c.wg.Add(1)
-	go c.etagFlushLoop()
+	c.wg.Go(c.etagFlushLoop)
 	return c, nil
 }
 
@@ -125,7 +124,6 @@ func (c *Cache) Close() error {
 }
 
 func (c *Cache) etagFlushLoop() {
-	defer c.wg.Done()
 	t := time.NewTicker(etagFlushInterval)
 	defer t.Stop()
 	for {

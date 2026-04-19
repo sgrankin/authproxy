@@ -1,6 +1,7 @@
 package main
 
 import (
+	"maps"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -58,8 +59,7 @@ func NewDiskLRU(maxSize int64) *DiskLRU {
 		closeCh: make(chan struct{}),
 	}
 	if maxSize > 0 {
-		d.wg.Add(1)
-		go d.evictLoop()
+		d.wg.Go(d.evictLoop)
 	}
 	return d
 }
@@ -143,7 +143,6 @@ func (d *DiskLRU) Forget(kind, key string) int64 {
 func (d *DiskLRU) Size() int64 { return d.sizeBytes.Load() }
 
 func (d *DiskLRU) evictLoop() {
-	defer d.wg.Done()
 	t := time.NewTicker(diskLRUInterval)
 	defer t.Stop()
 	for {
@@ -172,10 +171,7 @@ func (d *DiskLRU) checkEviction() {
 	for ek, e := range d.entries {
 		cands = append(cands, cand{ek.kind, ek.key, e})
 	}
-	kinds := make(map[string]DiskKind, len(d.kinds))
-	for k, v := range d.kinds {
-		kinds[k] = v
-	}
+	kinds := maps.Clone(d.kinds)
 	d.mu.Unlock()
 
 	sort.Slice(cands, func(i, j int) bool {
