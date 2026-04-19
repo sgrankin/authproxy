@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -225,6 +228,176 @@ func TestCache_VaryRefuses(t *testing.T) {
 	h.ServeHTTP(rec2, httptest.NewRequest("GET", "/", nil))
 	if rec2.Body.String() != "varies" {
 		t.Fatalf("second body: %q", rec2.Body.String())
+	}
+}
+
+func TestCache_StreamingFillSingleGET(t *testing.T) {
+	body := strings.Repeat("x", (4<<20)*2+100) // 3 chunks at 4 MiB chunkSize
+	const etag = `"stream"`
+	var gets, ranges atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if r.Header.Get("Range") != "" {
+				ranges.Add(1)
+			} else {
+				gets.Add(1)
+			}
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Accept-Ranges", "bytes")
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader(body))
+	}))
+	defer srv.Close()
+
+	c := newCache(t)
+	defer c.Close()
+	h := c.Handler(mustURL(t, srv.URL), nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code %d", rec.Code)
+	}
+	if rec.Body.Len() != len(body) {
+		t.Fatalf("body len %d, want %d", rec.Body.Len(), len(body))
+	}
+	if g := gets.Load(); g != 1 {
+		t.Errorf("expected 1 full GET (streaming-tee), got %d", g)
+	}
+	if r := ranges.Load(); r != 0 {
+		t.Errorf("expected 0 Range requests on initial fill, got %d", r)
+	}
+}
+
+func TestCache_ConcurrentRequestsShareFill(t *testing.T) {
+	body := strings.Repeat("y", (4<<20)+100) // 2 chunks
+	const etag = `"concurrent"`
+	var gets atomic.Int64
+
+	// Slow body so multiple concurrent requests definitely overlap the fill.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "" {
+			gets.Add(1)
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			// Write half, sleep, write rest. Forces the fill to span time.
+			w.Write([]byte(body[:len(body)/2]))
+			time.Sleep(50 * time.Millisecond)
+			w.Write([]byte(body[len(body)/2:]))
+			return
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Accept-Ranges", "bytes")
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader(body))
+	}))
+	defer srv.Close()
+
+	c := newCache(t)
+	defer c.Close()
+	h := c.Handler(mustURL(t, srv.URL), nil)
+
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("GET", "/y", nil))
+			if rec.Code != 200 {
+				t.Errorf("code %d", rec.Code)
+			}
+			if rec.Body.Len() != len(body) {
+				t.Errorf("body len %d, want %d", rec.Body.Len(), len(body))
+			}
+		}()
+	}
+	wg.Wait()
+
+	if g := gets.Load(); g != 1 {
+		t.Errorf("expected exactly 1 full upstream GET (concurrent dedup), got %d", g)
+	}
+}
+
+// TestCache_FillCancelByOriginator verifies that when client A (whose request
+// kicked off a streaming fill) cancels mid-stream, client B (waiting on the
+// same blob) recovers via per-chunk Range fetches.
+func TestCache_FillCancelByOriginator(t *testing.T) {
+	body := strings.Repeat("z", (4<<20)*3+50) // 4 chunks at 4 MiB
+	const etag = `"cancel"`
+
+	// Streaming GET writes the first chunk fast then blocks until released.
+	// Range requests serve normally.
+	releaseFill := make(chan struct{})
+	var streamingStarted atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Accept-Ranges", "bytes")
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "" {
+			// Streaming fill: write 1 chunk + flush, then block until released
+			// or the client disconnects.
+			streamingStarted.Store(true)
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(200)
+			w.Write([]byte(body[:4<<20])) // chunk 0
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			select {
+			case <-releaseFill:
+				w.Write([]byte(body[4<<20:]))
+			case <-r.Context().Done():
+				return
+			}
+			return
+		}
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader(body))
+	}))
+	defer srv.Close()
+
+	c := newCache(t)
+	defer c.Close()
+	h := c.Handler(mustURL(t, srv.URL), nil)
+
+	// Client A: cancellable context.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		req := httptest.NewRequest("GET", "/x", nil).WithContext(ctxA)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		// A may complete with truncated body or not — we don't assert on A.
+	}()
+
+	// Wait until streaming has started so B will arrive mid-fill.
+	deadline := time.After(2 * time.Second)
+	for !streamingStarted.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("streaming fill never started")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// Cancel A.
+	cancelA()
+	<-doneA
+
+	// Client B: should still complete with the full correct body, by recovering
+	// via per-chunk Range fetches for the unfilled chunks.
+	close(releaseFill) // unblock the (now-cancelled) streaming GET, just in case
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	if rec.Code != 200 {
+		t.Fatalf("B: code %d", rec.Code)
+	}
+	if rec.Body.Len() != len(body) {
+		t.Fatalf("B: body len %d, want %d. Headers: %v", rec.Body.Len(), len(body), rec.Header())
+	}
+	if rec.Body.String() != body {
+		t.Fatalf("B: body content mismatch")
 	}
 }
 

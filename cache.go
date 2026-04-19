@@ -234,13 +234,42 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 	c.etags[rk] = etag
 	c.mu.Unlock()
 
-	b := c.getOrCreateBlob(upstream, etag, meta)
+	b, created := c.getOrCreateBlob(upstream, etag, meta)
 	if b == nil {
 		c.passthrough(w, r, upstream, headers)
 		return
 	}
 	defer b.release()
+	if created {
+		// Kick off streaming-tee fill in a goroutine, sharing this request's
+		// context. If the client cancels mid-fill, remaining chunks are
+		// released back to empty so subsequent requests can recover them via
+		// per-chunk Range fetches.
+		fetchFull := c.fetchFullFn(upstream, r, headers, b.meta.ETag)
+		b.startStreamingFill(r.Context(), fetchFull)
+	}
 	c.serveFromBlob(w, r, upstream, headers, b)
+}
+
+// fetchFullFn returns a closure that issues a full-body GET of upstream for
+// the current request, with the given ETag enforced via If-Match.
+func (c *Cache) fetchFullFn(upstream *url.URL, r *http.Request, headers []Header, etag string) func(ctx context.Context) (io.ReadCloser, error) {
+	return func(ctx context.Context) (io.ReadCloser, error) {
+		out, err := buildOutbound(ctx, http.MethodGet, r, upstream, headers)
+		if err != nil {
+			return nil, err
+		}
+		out.Header.Set("If-Match", etag)
+		resp, err := c.client.Do(out)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("upstream GET: %d", resp.StatusCode)
+		}
+		return resp.Body, nil
+	}
 }
 
 // discover issues a HEAD against the upstream (following redirects). If
@@ -296,16 +325,18 @@ func (c *Cache) acquireBlob(key string) *blob {
 }
 
 // getOrCreateBlob returns an existing blob (with refcount incremented) or
-// creates a new one. Caller must release.
-func (c *Cache) getOrCreateBlob(upstream *url.URL, etag string, meta blobMeta) *blob {
+// creates a new one. The created return is true only on the path that
+// allocates a new blob — the caller can use it to decide whether to kick off
+// a streaming-tee fill. Caller must release.
+func (c *Cache) getOrCreateBlob(upstream *url.URL, etag string, meta blobMeta) (b *blob, created bool) {
 	key := blobKey(upstream, etag)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if b, ok := c.blobs[key]; ok {
-		b.acquire()
-		return b
+	if existing, ok := c.blobs[key]; ok {
+		existing.acquire()
+		return existing, false
 	}
-	b := &blob{
+	b = &blob{
 		key:       key,
 		dir:       filepath.Join(c.dir, key),
 		meta:      meta,
@@ -314,11 +345,11 @@ func (c *Cache) getOrCreateBlob(upstream *url.URL, etag string, meta blobMeta) *
 	}
 	if err := b.init(); err != nil {
 		log.Printf("cache: blob init %s: %v", key, err)
-		return nil
+		return nil, false
 	}
 	c.blobs[key] = b
 	b.acquire()
-	return b
+	return b, true
 }
 
 func (c *Cache) serveFromBlob(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header, b *blob) {
@@ -367,7 +398,6 @@ func (c *Cache) serveFromBlob(w http.ResponseWriter, r *http.Request, upstream *
 		if chunkEnd >= contentLen {
 			chunkEnd = contentLen - 1
 		}
-		// Slice within chunk
 		sliceFrom := off - chunkStart
 		sliceTo := chunkEnd - chunkStart
 		if end < chunkEnd {
@@ -741,46 +771,169 @@ func (b *blob) expectedChunkSize(idx int) int64 {
 }
 
 func (b *blob) ensureChunk(ctx context.Context, idx int, fetch func(ctx context.Context) error) error {
-	b.mu.Lock()
-	s := &b.chunks[idx]
-	switch s.state {
-	case chunkComplete:
-		b.mu.Unlock()
-		return nil
-	case chunkInflight:
-		ch := s.waiters
-		b.mu.Unlock()
-		select {
-		case <-ch:
+	for {
+		b.mu.Lock()
+		s := &b.chunks[idx]
+		switch s.state {
+		case chunkComplete:
+			b.mu.Unlock()
+			return nil
+		case chunkInflight:
+			ch := s.waiters
+			b.mu.Unlock()
+			select {
+			case <-ch:
+				// Re-loop: holder may have completed, errored, or released
+				// without writing (cancelled streaming-tee fill). Re-check.
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		default: // chunkEmpty
+			// Previous holder errored fatally — propagate rather than thrash.
+			if s.err != nil {
+				err := s.err
+				b.mu.Unlock()
+				return err
+			}
+			// Race: a previous holder released the chunk (closing waiters)
+			// in the same scheduling moment our own ctx was cancelled. The
+			// select above may have picked the waiter case; we'd otherwise
+			// proceed to claim+fetch with a cancelled ctx. Check ctx here
+			// so we propagate the cancellation rather than leaking work.
+			if err := ctx.Err(); err != nil {
+				b.mu.Unlock()
+				return err
+			}
+			s.state = chunkInflight
+			s.waiters = make(chan struct{})
+			b.mu.Unlock()
+
+			err := fetch(ctx)
+
 			b.mu.Lock()
-			err := s.err
+			if err == nil {
+				s.err = nil
+				s.state = chunkComplete
+				b.chunkCompleted(idx)
+			} else {
+				s.err = err
+				s.state = chunkEmpty
+				os.Remove(b.chunkPath(idx))
+			}
+			close(s.waiters)
+			s.waiters = nil
 			b.mu.Unlock()
 			return err
-		case <-ctx.Done():
-			return ctx.Err()
 		}
-	default: // chunkEmpty (or previously errored, which we reset to empty)
-		s.state = chunkInflight
-		s.waiters = make(chan struct{})
-		b.mu.Unlock()
+	}
+}
 
-		err := fetch(ctx)
+// startStreamingFill claims all currently-empty chunks and spawns a goroutine
+// to fill them sequentially from a single upstream GET. Bound to ctx — if ctx
+// is cancelled mid-fill, remaining chunks are released back to empty so
+// subsequent requests can recover them via per-chunk Range fetches.
+//
+// Returns immediately. No-op if no empty chunks (e.g. partial-recovery blob).
+// Caller must hold a refcount on b (so it doesn't get evicted underneath the
+// fill goroutine); the goroutine acquires its own refcount before returning
+// to the caller.
+func (b *blob) startStreamingFill(ctx context.Context, fetchFull func(ctx context.Context) (io.ReadCloser, error)) {
+	b.mu.Lock()
+	var claimed []int
+	for i := range b.chunks {
+		if b.chunks[i].state == chunkEmpty {
+			b.chunks[i].state = chunkInflight
+			b.chunks[i].waiters = make(chan struct{})
+			claimed = append(claimed, i)
+		}
+	}
+	b.mu.Unlock()
+	if len(claimed) == 0 {
+		return
+	}
+	b.acquire() // hold across the goroutine's lifetime
+	go func() {
+		defer b.release()
+		b.runStreamingFill(ctx, fetchFull, claimed)
+	}()
+}
 
-		b.mu.Lock()
+func (b *blob) runStreamingFill(ctx context.Context, fetchFull func(ctx context.Context) (io.ReadCloser, error), claimed []int) {
+	body, err := fetchFull(ctx)
+	if err != nil {
+		// Network-level error before any data — treat as cancellation, not
+		// a propagated fatal error, so subsequent requests can retry via
+		// per-chunk Range.
+		b.releaseClaimed(claimed, 0, nil)
+		return
+	}
+	defer body.Close()
+
+	buf := make([]byte, b.chunkSize)
+	for i, idx := range claimed {
+		size := b.expectedChunkSize(idx)
+		if _, err := io.ReadFull(body, buf[:size]); err != nil {
+			// Read error or stream cut short. Release this and remaining
+			// chunks without an error — let recovery happen via Range.
+			b.releaseClaimed(claimed, i, nil)
+			return
+		}
+		if err := b.writeChunkFromBytes(idx, buf[:size]); err != nil {
+			log.Printf("cache: streaming-fill write %s/%d: %v", b.key, idx, err)
+			b.releaseClaimed(claimed, i, nil)
+			return
+		}
+		b.markChunkComplete(idx)
+	}
+}
+
+// releaseClaimed transitions chunks claimed[from:] back to empty, setting
+// their err. Subsequent ensureChunk callers will re-attempt the fetch via
+// per-chunk Range (when err is nil) or propagate the err.
+func (b *blob) releaseClaimed(claimed []int, from int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, idx := range claimed[from:] {
+		s := &b.chunks[idx]
+		if s.state != chunkInflight {
+			continue
+		}
+		s.state = chunkEmpty
 		s.err = err
-		if err == nil {
-			s.state = chunkComplete
-			b.chunkCompleted(idx)
-		} else {
-			s.state = chunkEmpty
-			// Remove any partial file so future retries start clean.
-			os.Remove(b.chunkPath(idx))
+		if s.waiters != nil {
+			close(s.waiters)
+			s.waiters = nil
 		}
+	}
+}
+
+// markChunkComplete transitions a chunk to complete and signals waiters.
+func (b *blob) markChunkComplete(idx int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := &b.chunks[idx]
+	s.state = chunkComplete
+	s.err = nil
+	if s.waiters != nil {
 		close(s.waiters)
 		s.waiters = nil
-		b.mu.Unlock()
+	}
+	b.chunkCompleted(idx)
+}
+
+// writeChunkFromBytes writes data to chunk idx atomically. Length must equal
+// expectedChunkSize.
+func (b *blob) writeChunkFromBytes(idx int, data []byte) error {
+	want := b.expectedChunkSize(idx)
+	if int64(len(data)) != want {
+		return fmt.Errorf("chunk %d: %d bytes, want %d", idx, len(data), want)
+	}
+	tmp := b.chunkPath(idx) + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
+	return os.Rename(tmp, b.chunkPath(idx))
 }
 
 // writeChunk consumes body fully and writes it atomically to chunk idx.
