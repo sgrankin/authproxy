@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"tailscale.com/tsnet"
@@ -102,9 +103,20 @@ func (s *Service) tsnetListen(scheme string) (net.Listener, error) {
 }
 
 func (s *Service) handler() http.Handler {
+	var modify ModifyResponse
+	var proxyRouter http.Handler
+	if s.cfg.Adapter == "xet" {
+		clientBase := s.clientBaseURL()
+		modify = xetResponseModifier(clientBase)
+		// Separate http.Client for /_proxy/ forwarding: unlike c.client we
+		// don't want ResponseHeaderTimeout biting on streaming CAS body
+		// fetches (reconstruction downloads can take a while).
+		proxyRouter = xetProxyRouter(&http.Client{}, modify)
+	}
+
 	var inner http.Handler
 	if s.cache != nil {
-		inner = s.cache.Handler(s.cfg.Upstream, s.cfg.Headers, s.cfg.BlockResponseHeaders)
+		inner = s.cache.Handler(s.cfg.Upstream, s.cfg.Headers, s.cfg.BlockResponseHeaders, modify)
 	} else {
 		upstream := s.cfg.Upstream
 		headers := s.cfg.Headers
@@ -118,8 +130,10 @@ func (s *Service) handler() http.Handler {
 				}
 			},
 			ModifyResponse: func(resp *http.Response) error {
-				if len(block) == 0 {
-					return nil
+				if modify != nil {
+					if err := modify(resp); err != nil {
+						return err
+					}
 				}
 				for _, name := range block {
 					resp.Header.Del(name)
@@ -129,7 +143,38 @@ func (s *Service) handler() http.Handler {
 			ErrorLog: log.New(log.Writer(), s.cfg.Name+": ", log.LstdFlags),
 		}
 	}
+
+	if proxyRouter != nil {
+		inner = dispatchProxyPrefix(proxyRouter, inner)
+	}
 	return accessLog(s.cfg.Name, inner)
+}
+
+// dispatchProxyPrefix routes requests under proxyPathPrefix to the adapter
+// router; everything else goes to the normal handler.
+func dispatchProxyPrefix(proxyRouter, normal http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, proxyPathPrefix) {
+			proxyRouter.ServeHTTP(w, r)
+			return
+		}
+		normal.ServeHTTP(w, r)
+	})
+}
+
+// clientBaseURL returns scheme://host as clients see it. For tsnet services
+// we pick the first configured listen scheme; for local services we use http.
+// The scheme is what gets embedded in rewritten X-Xet-Cas-Endpoint values
+// and reconstruction-JSON URLs.
+func (s *Service) clientBaseURL() string {
+	if s.localAddr != "" {
+		return "http://" + s.localAddr
+	}
+	scheme := "https"
+	if len(s.cfg.Listen) > 0 {
+		scheme = s.cfg.Listen[0]
+	}
+	return scheme + "://" + s.cfg.Hostname
 }
 
 // accessLog wraps h with per-request logging:

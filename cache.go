@@ -255,9 +255,15 @@ func (c *Cache) load() error {
 	return nil
 }
 
-func (c *Cache) Handler(upstream *url.URL, headers []Header, blockResponseHeaders []string) http.Handler {
+// ModifyResponse is an optional hook invoked on each upstream response
+// (HEAD or passthrough GET) before the headers are cached or the body is
+// streamed. Adapters use it to rewrite protocol-specific headers (e.g. xet
+// endpoints) or reconstruction bodies.
+type ModifyResponse func(*http.Response) error
+
+func (c *Cache) Handler(upstream *url.URL, headers []Header, blockResponseHeaders []string, modify ModifyResponse) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c.serve(w, r, upstream, headers, blockResponseHeaders)
+		c.serve(w, r, upstream, headers, blockResponseHeaders, modify)
 	})
 }
 
@@ -283,9 +289,9 @@ func blobKeyFromHost(host, etag string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header, block []string) {
+func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header, block []string, modify ModifyResponse) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		c.passthrough(w, r, upstream, headers, block)
+		c.passthrough(w, r, upstream, headers, block, modify)
 		return
 	}
 
@@ -319,11 +325,11 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 	if etag == "" || !supportsRange || meta.ContentLength <= 0 {
 		// Not cacheable — no strong ETag, or upstream won't honor Range,
 		// or we can't predetermine size. Pass through.
-		c.passthrough(w, r, upstream, headers, block)
+		c.passthrough(w, r, upstream, headers, block, modify)
 		return
 	}
 	if hasUncacheableVary(meta.Header) {
-		c.passthrough(w, r, upstream, headers, block)
+		c.passthrough(w, r, upstream, headers, block, modify)
 		return
 	}
 
@@ -333,7 +339,7 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 
 	b, created := c.getOrCreateBlob(upstream, etag, meta)
 	if b == nil {
-		c.passthrough(w, r, upstream, headers, block)
+		c.passthrough(w, r, upstream, headers, block, modify)
 		return
 	}
 	defer b.release()
@@ -639,7 +645,7 @@ func (c *Cache) fetchChunkFn(upstream *url.URL, r *http.Request, headers []Heade
 	}
 }
 
-func (c *Cache) passthrough(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header, block []string) {
+func (c *Cache) passthrough(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header, block []string, modify ModifyResponse) {
 	out, err := buildOutbound(r.Context(), r.Method, r, upstream, headers)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -651,6 +657,12 @@ func (c *Cache) passthrough(w http.ResponseWriter, r *http.Request, upstream *ur
 		return
 	}
 	defer resp.Body.Close()
+	if modify != nil {
+		if err := modify(resp); err != nil {
+			http.Error(w, "upstream modify: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
 	streamResponse(w, resp, block)
 }
 

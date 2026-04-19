@@ -32,6 +32,9 @@ type ServiceConfig struct {
 	Listen               []string
 	Headers              []Header
 	BlockResponseHeaders []string
+	// Adapter installs protocol-specific handling on top of the generic
+	// proxy. Currently supported: "xet" (HuggingFace CAS passthrough).
+	Adapter string
 }
 
 type Header struct {
@@ -59,6 +62,7 @@ type rawService struct {
 	Listen               []string          `kdl:"listen"`
 	Headers              map[string]string `kdl:"header,multiple"`
 	BlockResponseHeaders []string          `kdl:"block-response-header"`
+	Adapter              string            `kdl:"adapter"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -134,6 +138,7 @@ func buildService(rs rawService) (ServiceConfig, error) {
 		Cache:                rs.Cache,
 		Listen:               rs.Listen,
 		BlockResponseHeaders: rs.BlockResponseHeaders,
+		Adapter:              rs.Adapter,
 	}
 	if s.Name == "" {
 		return s, fmt.Errorf("service: missing name argument")
@@ -159,6 +164,9 @@ func buildService(rs rawService) (ServiceConfig, error) {
 	}
 	if len(s.Listen) == 0 {
 		s.Listen = []string{"https"}
+	}
+	if s.Adapter != "" && s.Adapter != "xet" {
+		return s, fmt.Errorf("service %q: unknown adapter %q", s.Name, s.Adapter)
 	}
 	for hname, hval := range rs.Headers {
 		v, err := interpolateEnv(hval)

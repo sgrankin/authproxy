@@ -56,7 +56,7 @@ func TestCache_HitOnRevalidation(t *testing.T) {
 	defer srv.Close()
 
 	c := newCache(t)
-	h := c.Handler(mustURL(t, srv.URL), nil, nil)
+	h := c.Handler(mustURL(t, srv.URL), nil, nil, nil)
 
 	rec1 := httptest.NewRecorder()
 	h.ServeHTTP(rec1, httptest.NewRequest("GET", "/foo", nil))
@@ -92,7 +92,7 @@ func TestCache_RangeRequestServedFromCache(t *testing.T) {
 	defer srv.Close()
 
 	c := newCache(t)
-	h := c.Handler(mustURL(t, srv.URL), nil, nil)
+	h := c.Handler(mustURL(t, srv.URL), nil, nil, nil)
 
 	// Prime the cache.
 	rec := httptest.NewRecorder()
@@ -130,7 +130,7 @@ func TestCache_NoETagPassesThrough(t *testing.T) {
 	defer srv.Close()
 
 	c := newCache(t)
-	h := c.Handler(mustURL(t, srv.URL), nil, nil)
+	h := c.Handler(mustURL(t, srv.URL), nil, nil, nil)
 
 	for i := range 3 {
 		rec := httptest.NewRecorder()
@@ -156,7 +156,7 @@ func TestCache_HeaderInjection(t *testing.T) {
 	defer srv.Close()
 
 	c := newCache(t)
-	h := c.Handler(mustURL(t, srv.URL), []Header{{Name: "Authorization", Value: "Bearer secret"}}, nil)
+	h := c.Handler(mustURL(t, srv.URL), []Header{{Name: "Authorization", Value: "Bearer secret"}}, nil, nil)
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
 	if got, _ := seenAuth.Load().(string); got != "Bearer secret" {
 		t.Errorf("upstream saw Authorization=%q", got)
@@ -170,7 +170,7 @@ func TestCache_ClientConditional(t *testing.T) {
 	defer srv.Close()
 
 	c := newCache(t)
-	h := c.Handler(mustURL(t, srv.URL), nil, nil)
+	h := c.Handler(mustURL(t, srv.URL), nil, nil, nil)
 
 	// Prime cache.
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
@@ -201,7 +201,7 @@ func TestCache_BlockResponseHeaders(t *testing.T) {
 	defer srv.Close()
 
 	c := newCache(t)
-	h := c.Handler(mustURL(t, srv.URL), nil, []string{"X-Xet-Hash", "Link"})
+	h := c.Handler(mustURL(t, srv.URL), nil, []string{"X-Xet-Hash", "Link"}, nil)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/f", nil))
@@ -262,7 +262,7 @@ func TestCache_DiscoverFollowsRedirectAndMergesHeaders(t *testing.T) {
 
 	c := newCache(t)
 	defer c.Close()
-	h := c.Handler(mustURL(t, origin.URL), nil, nil)
+	h := c.Handler(mustURL(t, origin.URL), nil, nil, nil)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("HEAD", "/m", nil))
@@ -324,7 +324,7 @@ func TestCache_LinkedEtagIdentity(t *testing.T) {
 	c := newCache(t)
 	defer c.Close()
 	u := mustURL(t, srv.URL)
-	h := c.Handler(u, nil, nil)
+	h := c.Handler(u, nil, nil, nil)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/q", nil))
@@ -374,7 +374,7 @@ func TestCache_HEADDoesNotPrefetchFirstChunk(t *testing.T) {
 	c := newCache(t)
 	defer c.Close()
 	u := mustURL(t, srv.URL)
-	h := c.Handler(u, nil, nil)
+	h := c.Handler(u, nil, nil, nil)
 
 	// Prime the cache (streaming-fill completes) then simulate chunk 0 being
 	// missing (e.g. partial prior fill or manual eviction).
@@ -433,7 +433,7 @@ func TestCache_VaryRefuses(t *testing.T) {
 	defer srv.Close()
 
 	c := newCache(t)
-	h := c.Handler(mustURL(t, srv.URL), nil, nil)
+	h := c.Handler(mustURL(t, srv.URL), nil, nil, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
 	if rec.Body.String() != "varies" {
@@ -470,7 +470,7 @@ func TestCache_StreamingFillSingleGET(t *testing.T) {
 
 	c := newCache(t)
 	defer c.Close()
-	h := c.Handler(mustURL(t, srv.URL), nil, nil)
+	h := c.Handler(mustURL(t, srv.URL), nil, nil, nil)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
@@ -514,7 +514,7 @@ func TestCache_ConcurrentRequestsShareFill(t *testing.T) {
 
 	c := newCache(t)
 	defer c.Close()
-	h := c.Handler(mustURL(t, srv.URL), nil, nil)
+	h := c.Handler(mustURL(t, srv.URL), nil, nil, nil)
 
 	var wg sync.WaitGroup
 	for range 3 {
@@ -576,7 +576,7 @@ func TestCache_FillCancelByOriginator(t *testing.T) {
 
 	c := newCache(t)
 	defer c.Close()
-	h := c.Handler(mustURL(t, srv.URL), nil, nil)
+	h := c.Handler(mustURL(t, srv.URL), nil, nil, nil)
 
 	// Client A: cancellable context.
 	ctxA, cancelA := context.WithCancel(context.Background())
@@ -634,8 +634,8 @@ func TestCache_LRUEviction(t *testing.T) {
 
 	urlA := mustURL(t, srvA.URL)
 	urlB := mustURL(t, srvB.URL)
-	hA := c.Handler(urlA, nil, nil)
-	hB := c.Handler(urlB, nil, nil)
+	hA := c.Handler(urlA, nil, nil, nil)
+	hB := c.Handler(urlB, nil, nil, nil)
 
 	hA.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
 	// Sleep so B's lastAccess > A's.
@@ -676,7 +676,7 @@ func TestCache_LRUSkipsInFlight(t *testing.T) {
 	defer c.Close()
 
 	u := mustURL(t, srv.URL)
-	h := c.Handler(u, nil, nil)
+	h := c.Handler(u, nil, nil, nil)
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
 
 	// Manually pin the blob's refcount.
@@ -711,7 +711,7 @@ func TestCache_EtagPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	u := mustURL(t, srv.URL)
-	h1 := c1.Handler(u, nil, nil)
+	h1 := c1.Handler(u, nil, nil, nil)
 	h1.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/p", nil))
 	if err := c1.Close(); err != nil {
 		t.Fatal(err)
