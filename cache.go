@@ -342,21 +342,27 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 		// context. If the client cancels mid-fill, remaining chunks are
 		// released back to empty so subsequent requests can recover them via
 		// per-chunk Range fetches.
-		fetchFull := c.fetchFullFn(upstream, r, headers, b.meta.ETag)
+		fetchFull := c.fetchFullFn(upstream, r, headers, b.meta.UpstreamETag)
 		b.startStreamingFill(r.Context(), fetchFull)
 	}
 	c.serveFromBlob(w, r, upstream, headers, b)
 }
 
 // fetchFullFn returns a closure that issues a full-body GET of upstream for
-// the current request, with the given ETag enforced via If-Match.
-func (c *Cache) fetchFullFn(upstream *url.URL, r *http.Request, headers []Header, etag string) func(ctx context.Context) (io.ReadCloser, error) {
+// the current request. If upstreamETag is non-empty it's enforced via
+// If-Match (guards against the upstream swapping content mid-fetch). Empty
+// means the upstream didn't expose an etag usable at the body URL (e.g. a
+// redirect target's CDN that HF's X-Linked-Etag doesn't match) — skip the
+// precondition.
+func (c *Cache) fetchFullFn(upstream *url.URL, r *http.Request, headers []Header, upstreamETag string) func(ctx context.Context) (io.ReadCloser, error) {
 	return func(ctx context.Context) (io.ReadCloser, error) {
 		out, err := buildOutbound(ctx, http.MethodGet, r, upstream, headers)
 		if err != nil {
 			return nil, err
 		}
-		out.Header.Set("If-Match", etag)
+		if upstreamETag != "" {
+			out.Header.Set("If-Match", upstreamETag)
+		}
 		resp, err := c.client.Do(out)
 		if err != nil {
 			return nil, err
@@ -397,13 +403,15 @@ func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request
 	case resp.StatusCode == http.StatusNotModified:
 		return knownETag, blobMeta{}, true, nil
 	case resp.StatusCode == http.StatusOK:
-		etag = strongETag(resp.Header.Get("ETag"))
+		respETag := strongETag(resp.Header.Get("ETag"))
+		etag = preferLinkedETag(resp.Header, respETag)
 		supportsRange = strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes")
 		meta = blobMeta{
 			ETag:          etag,
+			UpstreamETag:  respETag,
 			StatusCode:    http.StatusOK,
 			ContentType:   resp.Header.Get("Content-Type"),
-			ContentLength: resp.ContentLength,
+			ContentLength: preferLinkedSize(resp.Header, resp.ContentLength),
 			Header:        filterResponseHeaders(resp.Header, block),
 			ChunkSize:     c.chunkSize,
 		}
@@ -441,13 +449,17 @@ func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request
 			merged[k] = append([]string{}, vs...)
 		}
 		merged.Del("Location")
-		etag = strongETag(followResp.Header.Get("ETag"))
-		supportsRange = strings.EqualFold(followResp.Header.Get("Accept-Ranges"), "bytes")
+		respETag := strongETag(followResp.Header.Get("ETag"))
+		// Linked headers are on the origin's 3xx (resp), not the CDN's 200.
+		etag = preferLinkedETag(resp.Header, respETag)
+		supportsRange = strings.EqualFold(followResp.Header.Get("Accept-Ranges"), "bytes") ||
+			strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes")
 		meta = blobMeta{
 			ETag:          etag,
+			UpstreamETag:  respETag,
 			StatusCode:    http.StatusOK,
 			ContentType:   followResp.Header.Get("Content-Type"),
-			ContentLength: followResp.ContentLength,
+			ContentLength: preferLinkedSize(resp.Header, followResp.ContentLength),
 			Header:        filterResponseHeaders(merged, block),
 			ChunkSize:     c.chunkSize,
 		}
@@ -592,8 +604,12 @@ func (c *Cache) fetchChunkFn(upstream *url.URL, r *http.Request, headers []Heade
 			return err
 		}
 		out.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", chunkStart, chunkEnd))
-		// Validate: only accept if upstream still serves this same ETag.
-		out.Header.Set("If-Match", b.meta.ETag)
+		// Validate against the upstream's own ETag (the body URL's CDN etag,
+		// not our canonical X-Linked-Etag which the CDN doesn't know). Skip
+		// the precondition if the upstream didn't give us one.
+		if b.meta.UpstreamETag != "" {
+			out.Header.Set("If-Match", b.meta.UpstreamETag)
+		}
 
 		resp, err := c.client.Do(out)
 		if err != nil {
@@ -711,6 +727,29 @@ func joinPaths(a, b string) string {
 	}
 }
 
+// preferLinkedETag returns the strong X-Linked-Etag value if present (that's
+// the upstream-declared content hash for the file, e.g. HF's LFS digest),
+// otherwise the given fallback. The linked etag is stable across CDN boundary
+// crossings where the response ETag is not.
+func preferLinkedETag(h http.Header, fallback string) string {
+	if linked := strongETag(h.Get("X-Linked-Etag")); linked != "" {
+		return linked
+	}
+	return fallback
+}
+
+// preferLinkedSize returns X-Linked-Size if parseable and positive, otherwise
+// the given fallback. Needed for redirects where the origin's Content-Length
+// describes a tiny redirect body instead of the real resource size.
+func preferLinkedSize(h http.Header, fallback int64) int64 {
+	if v := h.Get("X-Linked-Size"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
 func strongETag(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || strings.HasPrefix(raw, "W/") {
@@ -823,7 +862,15 @@ func parseRange(rangeHdr string, contentLen int64) (start, end int64, partial, o
 // --- blob ---
 
 type blobMeta struct {
-	ETag          string      `json:"etag"`
+	// ETag is the canonical file identity — prefer X-Linked-Etag (the content
+	// hash HF exposes on HEAD) over the final response's ETag. Used as the
+	// cache key and served to clients.
+	ETag string `json:"etag"`
+	// UpstreamETag is the ETag on the final-resource HEAD (the CDN ETag for
+	// HF). Needed for If-Match on chunked Range GETs against the CDN, which
+	// doesn't know about X-Linked-Etag. Empty if no redirect or the final
+	// upstream didn't send one.
+	UpstreamETag  string      `json:"upstream_etag,omitempty"`
 	StatusCode    int         `json:"status"`
 	ContentType   string      `json:"content_type,omitempty"`
 	ContentLength int64       `json:"content_length"`

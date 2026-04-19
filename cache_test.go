@@ -278,8 +278,9 @@ func TestCache_DiscoverFollowsRedirectAndMergesHeaders(t *testing.T) {
 	if got := rec.Header().Get("X-Linked-Size"); got != strconv.Itoa(len(body)) {
 		t.Errorf("X-Linked-Size: %q", got)
 	}
-	if got := rec.Header().Get("ETag"); got != cdnETag {
-		t.Errorf("ETag: %q want %q", got, cdnETag)
+	// Canonical ETag served to clients is the linked-etag, not the CDN's.
+	if got := rec.Header().Get("ETag"); got != `"linked-v1"` {
+		t.Errorf("ETag: %q want \"linked-v1\"", got)
 	}
 	if got := rec.Header().Get("Content-Type"); got != "application/octet-stream" {
 		t.Errorf("Content-Type: %q", got)
@@ -296,6 +297,59 @@ func TestCache_DiscoverFollowsRedirectAndMergesHeaders(t *testing.T) {
 	}
 	if rec2.Body.Len() != len(body) {
 		t.Fatalf("GET body len %d, want %d", rec2.Body.Len(), len(body))
+	}
+}
+
+// Verifies the cache keys blobs by X-Linked-Etag (not the response ETag) and
+// issues chunk-fetch If-Match against the response ETag (not X-Linked-Etag —
+// the downstream CDN doesn't know the linked one).
+func TestCache_LinkedEtagIdentity(t *testing.T) {
+	body := strings.Repeat("p", 4096)
+	const cdnETag = `"cdn-ab"`
+	const linkedETag = `"linked-cd"`
+	var ifMatchSeen atomic.Value
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			ifMatchSeen.Store(r.Header.Get("If-Match"))
+		}
+		w.Header().Set("ETag", cdnETag)
+		w.Header().Set("X-Linked-Etag", linkedETag)
+		w.Header().Set("X-Linked-Size", strconv.Itoa(len(body)))
+		w.Header().Set("Accept-Ranges", "bytes")
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader(body))
+	}))
+	defer srv.Close()
+
+	c := newCache(t)
+	defer c.Close()
+	u := mustURL(t, srv.URL)
+	h := c.Handler(u, nil, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/q", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code %d", rec.Code)
+	}
+	if got := rec.Header().Get("ETag"); got != linkedETag {
+		t.Errorf("served ETag: got %q, want %q", got, linkedETag)
+	}
+	// Blob should be keyed by linked ETag.
+	c.mu.Lock()
+	_, hasLinked := c.blobs[blobKey(u, linkedETag)]
+	_, hasCDN := c.blobs[blobKey(u, cdnETag)]
+	c.mu.Unlock()
+	if !hasLinked {
+		t.Error("blob should be keyed on linked ETag")
+	}
+	if hasCDN {
+		t.Error("blob should NOT be keyed on CDN ETag")
+	}
+	// If-Match on the body fetch should have been the CDN ETag — that's what
+	// the upstream recognizes. If we'd sent linked-ETag the upstream might
+	// 412.
+	if got, _ := ifMatchSeen.Load().(string); got != cdnETag {
+		t.Errorf("If-Match on body fetch: got %q, want %q", got, cdnETag)
 	}
 }
 
