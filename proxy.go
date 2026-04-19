@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"path/filepath"
+	"time"
 
 	"tailscale.com/tsnet"
 )
@@ -101,19 +102,76 @@ func (s *Service) tsnetListen(scheme string) (net.Listener, error) {
 }
 
 func (s *Service) handler() http.Handler {
+	var inner http.Handler
 	if s.cache != nil {
-		return s.cache.Handler(s.cfg.Upstream, s.cfg.Headers)
+		inner = s.cache.Handler(s.cfg.Upstream, s.cfg.Headers)
+	} else {
+		upstream := s.cfg.Upstream
+		headers := s.cfg.Headers
+		inner = &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetURL(upstream)
+				pr.Out.Host = upstream.Host
+				for _, h := range headers {
+					pr.Out.Header.Set(h.Name, h.Value)
+				}
+			},
+			ErrorLog: log.New(log.Writer(), s.cfg.Name+": ", log.LstdFlags),
+		}
 	}
-	upstream := s.cfg.Upstream
-	headers := s.cfg.Headers
-	return &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(upstream)
-			pr.Out.Host = upstream.Host
-			for _, h := range headers {
-				pr.Out.Header.Set(h.Name, h.Value)
-			}
-		},
-		ErrorLog: log.New(log.Writer(), s.cfg.Name+": ", log.LstdFlags),
+	return accessLog(s.cfg.Name, inner)
+}
+
+// accessLog wraps h with per-request logging:
+//
+//	<service> <client> <method> <path> <status> <bytes> <duration>
+func accessLog(service string, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lw := &loggingResponseWriter{ResponseWriter: w, status: 200}
+		start := time.Now()
+		h.ServeHTTP(lw, r)
+		log.Printf("%s %s %s %s %d %d %s",
+			service, clientAddr(r), r.Method, r.URL.RequestURI(),
+			lw.status, lw.bytes, time.Since(start).Round(time.Millisecond))
+	})
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	bytes       int64
+	wroteHeader bool
+}
+
+func (w *loggingResponseWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.status = code
+		w.wroteHeader = true
 	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += int64(n)
+	return n, err
+}
+
+// Flush proxies through to the underlying writer if it supports flushing.
+// Streaming responses (e.g. tee'd cache fills) need this to work.
+func (w *loggingResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func clientAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
