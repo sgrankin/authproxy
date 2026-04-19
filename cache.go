@@ -445,6 +445,20 @@ func (c *Cache) serveFromBlob(w http.ResponseWriter, r *http.Request, upstream *
 		return
 	}
 
+	// Pre-fetch the first chunk before committing response headers. This way,
+	// fetch failures on the very first chunk surface as a clean 502 rather
+	// than a truncated 200/206 with mismatched Content-Length. Mid-stream
+	// failures on later chunks still result in a truncated body — the Go
+	// http.Client detects this as ErrUnexpectedEOF via the Content-Length
+	// mismatch — but at least the request gets *some* coherent feedback.
+	chunkSize := b.chunkSize
+	firstIdx := int(start / chunkSize)
+	if err := b.ensureChunk(r.Context(), firstIdx, c.fetchChunkFn(upstream, r, headers, b, firstIdx)); err != nil {
+		log.Printf("cache: ensure first chunk %d: %v", firstIdx, err)
+		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
 	for k, vs := range b.meta.Header {
 		w.Header()[k] = append([]string{}, vs...)
 	}
@@ -466,7 +480,6 @@ func (c *Cache) serveFromBlob(w http.ResponseWriter, r *http.Request, upstream *
 	}
 
 	// Walk chunks covering [start, end] and stream their bytes.
-	chunkSize := b.chunkSize
 	for off := start; off <= end; {
 		idx := int(off / chunkSize)
 		chunkStart := int64(idx) * chunkSize
@@ -479,9 +492,11 @@ func (c *Cache) serveFromBlob(w http.ResponseWriter, r *http.Request, upstream *
 		if end < chunkEnd {
 			sliceTo = end - chunkStart
 		}
-		if err := b.ensureChunk(r.Context(), idx, c.fetchChunkFn(upstream, r, headers, b, idx)); err != nil {
-			log.Printf("cache: ensure chunk %d: %v", idx, err)
-			return
+		if idx != firstIdx {
+			if err := b.ensureChunk(r.Context(), idx, c.fetchChunkFn(upstream, r, headers, b, idx)); err != nil {
+				log.Printf("cache: ensure chunk %d: %v", idx, err)
+				return
+			}
 		}
 		if err := b.copyChunk(w, idx, sliceFrom, sliceTo); err != nil {
 			log.Printf("cache: copy chunk %d: %v", idx, err)
