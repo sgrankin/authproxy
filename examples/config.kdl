@@ -1,0 +1,22 @@
+// authproxy config — KDL format
+
+cache {
+    dir "~/.cache/authproxy"
+    max-size "100GB"
+    chunk-size "4MiB"
+}
+
+service "huggingface" {
+    hostname "hf"
+    upstream "https://huggingface.co"
+    cache true
+    listen "http" "https"
+    header "Authorization" "Bearer ${env:HF_TOKEN}"
+}
+
+service "openai" {
+    hostname "openai"
+    upstream "https://api.openai.com"
+    listen "http" "https"
+    header "Authorization" "Bearer ${env:OPENAI_API_KEY}"
+}
