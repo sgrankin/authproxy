@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
-	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
 )
 
 func main() {
@@ -14,9 +18,38 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	fmt.Printf("loaded %d service(s):\n", len(cfg.Services))
-	for _, s := range cfg.Services {
-		fmt.Printf("  %s -> %s (cache=%v, listen=%v, %d header(s))\n",
-			s.Hostname, s.Upstream, s.Cache, s.Listen, len(s.Headers))
+
+	stateDir, err := defaultStateDir()
+	if err != nil {
+		log.Fatalf("state dir: %v", err)
 	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		log.Fatalf("mkdir state: %v", err)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	var services []*Service
+	for _, sc := range cfg.Services {
+		svc := NewService(sc, stateDir)
+		if err := svc.Start(ctx); err != nil {
+			log.Fatalf("%s: %v", sc.Name, err)
+		}
+		services = append(services, svc)
+	}
+
+	<-ctx.Done()
+	log.Printf("shutting down")
+	for _, s := range services {
+		s.Close()
+	}
+}
+
+func defaultStateDir() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "authproxy"), nil
 }
