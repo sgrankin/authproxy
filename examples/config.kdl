@@ -12,6 +12,10 @@ service "huggingface" {
     cache true
     listen "http" "https"
     header "Authorization" "Bearer ${env:HF_TOKEN}"
+
+    // Suppress HF's Xet hints so the client stays on the HTTP download path
+    // (which this proxy caches). See README / CLAUDE.md for the rationale.
+    block-response-header "X-Xet-Hash" "X-Xet-Refresh-Route" "Link"
 }
 
 service "openai" {

@@ -25,12 +25,13 @@ type CacheConfig struct {
 }
 
 type ServiceConfig struct {
-	Name     string
-	Hostname string
-	Upstream *url.URL
-	Cache    bool
-	Listen   []string
-	Headers  []Header
+	Name                 string
+	Hostname             string
+	Upstream             *url.URL
+	Cache                bool
+	Listen               []string
+	Headers              []Header
+	BlockResponseHeaders []string
 }
 
 type Header struct {
@@ -51,12 +52,13 @@ type rawCache struct {
 }
 
 type rawService struct {
-	Name     string            `kdl:",arg"`
-	Hostname string            `kdl:"hostname"`
-	Upstream string            `kdl:"upstream"`
-	Cache    bool              `kdl:"cache"`
-	Listen   []string          `kdl:"listen"`
-	Headers  map[string]string `kdl:"header,multiple"`
+	Name                 string            `kdl:",arg"`
+	Hostname             string            `kdl:"hostname"`
+	Upstream             string            `kdl:"upstream"`
+	Cache                bool              `kdl:"cache"`
+	Listen               []string          `kdl:"listen"`
+	Headers              map[string]string `kdl:"header,multiple"`
+	BlockResponseHeaders []string          `kdl:"block-response-header"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -127,10 +129,11 @@ func ParseConfig(r io.Reader) (*Config, error) {
 
 func buildService(rs rawService) (ServiceConfig, error) {
 	s := ServiceConfig{
-		Name:     rs.Name,
-		Hostname: rs.Hostname,
-		Cache:    rs.Cache,
-		Listen:   rs.Listen,
+		Name:                 rs.Name,
+		Hostname:             rs.Hostname,
+		Cache:                rs.Cache,
+		Listen:               rs.Listen,
+		BlockResponseHeaders: rs.BlockResponseHeaders,
 	}
 	if s.Name == "" {
 		return s, fmt.Errorf("service: missing name argument")

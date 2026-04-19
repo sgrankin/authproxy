@@ -22,6 +22,7 @@ service "huggingface" {
     cache true
     listen "http" "https"
     header "Authorization" "Bearer ${env:HF_TOKEN}"
+    block-response-header "X-Xet-Hash" "Link"
 }
 
 service "openai" {
@@ -62,6 +63,9 @@ service "openai" {
 	}
 	if len(hf.Headers) != 1 || hf.Headers[0].Value != "Bearer hf_xyz" {
 		t.Errorf("hf headers: %+v", hf.Headers)
+	}
+	if got := hf.BlockResponseHeaders; len(got) != 2 || got[0] != "X-Xet-Hash" || got[1] != "Link" {
+		t.Errorf("hf block-response-header: %v", got)
 	}
 
 	oa := c.Services[1]

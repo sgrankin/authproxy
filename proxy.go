@@ -104,10 +104,11 @@ func (s *Service) tsnetListen(scheme string) (net.Listener, error) {
 func (s *Service) handler() http.Handler {
 	var inner http.Handler
 	if s.cache != nil {
-		inner = s.cache.Handler(s.cfg.Upstream, s.cfg.Headers)
+		inner = s.cache.Handler(s.cfg.Upstream, s.cfg.Headers, s.cfg.BlockResponseHeaders)
 	} else {
 		upstream := s.cfg.Upstream
 		headers := s.cfg.Headers
+		block := s.cfg.BlockResponseHeaders
 		inner = &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				pr.SetURL(upstream)
@@ -115,6 +116,15 @@ func (s *Service) handler() http.Handler {
 				for _, h := range headers {
 					pr.Out.Header.Set(h.Name, h.Value)
 				}
+			},
+			ModifyResponse: func(resp *http.Response) error {
+				if len(block) == 0 {
+					return nil
+				}
+				for _, name := range block {
+					resp.Header.Del(name)
+				}
+				return nil
 			},
 			ErrorLog: log.New(log.Writer(), s.cfg.Name+": ", log.LstdFlags),
 		}

@@ -183,8 +183,8 @@ func (c *Cache) checkEviction() {
 	defer c.mu.Unlock()
 
 	type cand struct {
-		b   *blob
-		ts  int64
+		b  *blob
+		ts int64
 	}
 	cands := make([]cand, 0, len(c.blobs))
 	for _, b := range c.blobs {
@@ -245,9 +245,9 @@ func (c *Cache) load() error {
 	return nil
 }
 
-func (c *Cache) Handler(upstream *url.URL, headers []Header) http.Handler {
+func (c *Cache) Handler(upstream *url.URL, headers []Header, blockResponseHeaders []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c.serve(w, r, upstream, headers)
+		c.serve(w, r, upstream, headers, blockResponseHeaders)
 	})
 }
 
@@ -273,9 +273,9 @@ func blobKeyFromHost(host, etag string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header) {
+func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header, block []string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		c.passthrough(w, r, upstream, headers)
+		c.passthrough(w, r, upstream, headers, block)
 		return
 	}
 
@@ -286,7 +286,7 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 
 	// Discover the current upstream state (HEAD with conditional). We follow
 	// redirects so the response we get is the final one (e.g. HF → CDN).
-	etag, meta, supportsRange, err := c.discover(r.Context(), upstream, r, headers, knownETag)
+	etag, meta, supportsRange, err := c.discover(r.Context(), upstream, r, headers, block, knownETag)
 	if err != nil {
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 		return
@@ -309,11 +309,11 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 	if etag == "" || !supportsRange || meta.ContentLength <= 0 {
 		// Not cacheable — no strong ETag, or upstream won't honor Range,
 		// or we can't predetermine size. Pass through.
-		c.passthrough(w, r, upstream, headers)
+		c.passthrough(w, r, upstream, headers, block)
 		return
 	}
 	if hasUncacheableVary(meta.Header) {
-		c.passthrough(w, r, upstream, headers)
+		c.passthrough(w, r, upstream, headers, block)
 		return
 	}
 
@@ -323,7 +323,7 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, upstream *url.URL,
 
 	b, created := c.getOrCreateBlob(upstream, etag, meta)
 	if b == nil {
-		c.passthrough(w, r, upstream, headers)
+		c.passthrough(w, r, upstream, headers, block)
 		return
 	}
 	defer b.release()
@@ -362,7 +362,7 @@ func (c *Cache) fetchFullFn(upstream *url.URL, r *http.Request, headers []Header
 // discover issues a HEAD against the upstream (following redirects). If
 // knownETag is non-empty it's sent as If-None-Match; on 304 the function
 // returns etag = knownETag and meta from the original cached entry.
-func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request, headers []Header, knownETag string) (etag string, meta blobMeta, supportsRange bool, err error) {
+func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request, headers []Header, block []string, knownETag string) (etag string, meta blobMeta, supportsRange bool, err error) {
 	out, err := buildOutbound(ctx, http.MethodHead, r, upstream, headers)
 	if err != nil {
 		return "", blobMeta{}, false, err
@@ -388,7 +388,7 @@ func (c *Cache) discover(ctx context.Context, upstream *url.URL, r *http.Request
 			StatusCode:    http.StatusOK,
 			ContentType:   resp.Header.Get("Content-Type"),
 			ContentLength: resp.ContentLength,
-			Header:        cacheableHeaders(resp.Header),
+			Header:        filterResponseHeaders(resp.Header, block),
 			ChunkSize:     c.chunkSize,
 		}
 		return etag, meta, supportsRange, nil
@@ -557,7 +557,7 @@ func (c *Cache) fetchChunkFn(upstream *url.URL, r *http.Request, headers []Heade
 	}
 }
 
-func (c *Cache) passthrough(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header) {
+func (c *Cache) passthrough(w http.ResponseWriter, r *http.Request, upstream *url.URL, headers []Header, block []string) {
 	out, err := buildOutbound(r.Context(), r.Method, r, upstream, headers)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -569,14 +569,11 @@ func (c *Cache) passthrough(w http.ResponseWriter, r *http.Request, upstream *ur
 		return
 	}
 	defer resp.Body.Close()
-	streamResponse(w, resp)
+	streamResponse(w, resp, block)
 }
 
-func streamResponse(w http.ResponseWriter, resp *http.Response) {
-	for k, vs := range resp.Header {
-		if isHopByHop(k, resp.Header.Get("Connection")) {
-			continue
-		}
+func streamResponse(w http.ResponseWriter, resp *http.Response, block []string) {
+	for k, vs := range filterResponseHeaders(resp.Header, block) {
 		w.Header()[k] = append([]string{}, vs...)
 	}
 	w.WriteHeader(resp.StatusCode)
@@ -665,20 +662,26 @@ func strongETag(raw string) string {
 	return raw
 }
 
-func cacheableHeaders(h http.Header) http.Header {
-	keep := map[string]bool{
-		"Cache-Control":       true,
-		"Last-Modified":       true,
-		"Content-Disposition": true,
-		"Content-Encoding":    true,
-		"Vary":                true,
-		"Accept-Ranges":       true,
+// filterResponseHeaders returns a copy of h with hop-by-hop headers and any
+// user-configured blocked headers removed.
+func filterResponseHeaders(h http.Header, block []string) http.Header {
+	conn := h.Get("Connection")
+	var blockSet map[string]bool
+	if len(block) > 0 {
+		blockSet = make(map[string]bool, len(block))
+		for _, name := range block {
+			blockSet[http.CanonicalHeaderKey(name)] = true
+		}
 	}
 	out := http.Header{}
 	for k, vs := range h {
-		if keep[http.CanonicalHeaderKey(k)] {
-			out[k] = append([]string{}, vs...)
+		if isHopByHop(k, conn) {
+			continue
 		}
+		if blockSet[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		out[k] = append([]string{}, vs...)
 	}
 	return out
 }
@@ -794,7 +797,6 @@ func (b *blob) chunkCompleted(idx int) {
 		b.cache.sizeBytes.Add(size)
 	}
 }
-
 
 type chunkState uint8
 
