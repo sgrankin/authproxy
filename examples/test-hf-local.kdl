@@ -1,0 +1,13 @@
+// Minimal config for local testing against HF (no auth, public models only).
+cache {
+    dir "/tmp/authproxy-testcache"
+    max-size "1GB"
+    chunk-size "4MiB"
+}
+
+service "huggingface" {
+    hostname "hf"
+    upstream "https://huggingface.co"
+    cache true
+    listen "http"
+}

@@ -180,6 +180,28 @@ func TestCache_ClientConditional(t *testing.T) {
 	}
 }
 
+func TestHasUncacheableVary(t *testing.T) {
+	cases := map[string]bool{
+		"":               false,
+		"Accept-Encoding": false,
+		"Origin":          false,
+		"Accept":          false,
+		"origin, accept-encoding": false,
+		"Access-Control-Request-Method": false,
+		"origin,access-control-request-method,access-control-request-headers": false,
+		"Cookie":     true,
+		"User-Agent": true,
+		"Authorization": true,
+		"Origin, Cookie": true,
+	}
+	for in, want := range cases {
+		h := http.Header{"Vary": []string{in}}
+		if got := hasUncacheableVary(h); got != want {
+			t.Errorf("Vary %q: got %v, want %v", in, got, want)
+		}
+	}
+}
+
 func TestCache_VaryRefuses(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"v"`)

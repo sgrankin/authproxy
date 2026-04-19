@@ -459,12 +459,20 @@ func hasUncacheableVary(h http.Header) bool {
 		return false
 	}
 	for name := range strings.SplitSeq(v, ",") {
-		switch strings.ToLower(strings.TrimSpace(name)) {
-		case "", "accept-encoding":
+		canon := strings.ToLower(strings.TrimSpace(name))
+		switch canon {
+		case "", "accept-encoding", "origin", "accept":
+			// accept-encoding: we don't negotiate gzip; outbound is identity.
+			// origin/accept: single-origin proxy → constant.
 			continue
-		default:
-			return true
 		}
+		if strings.HasPrefix(canon, "access-control-") {
+			// CORS preflight headers; meaningful only for OPTIONS.
+			continue
+		}
+		// Vary on client-specific things (Cookie, Authorization, User-Agent, etc.)
+		// genuinely creates cache-poisoning risk; refuse.
+		return true
 	}
 	return false
 }
