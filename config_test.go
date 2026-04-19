@@ -103,3 +103,37 @@ func TestInterpolateEnv_Missing(t *testing.T) {
 		t.Error("expected error for missing env var")
 	}
 }
+
+func TestParseConfig_UnknownKey(t *testing.T) {
+	cases := map[string]string{
+		"top-level": `
+unknown-top-level "x"
+service "x" {
+    hostname "x"
+    upstream "https://x.example"
+}
+`,
+		"in-service": `
+service "x" {
+    hostname "x"
+    upstream "https://x.example"
+    typoed-key "x"
+}
+`,
+		"in-cache": `
+cache {
+    dirr "/tmp"
+}
+service "x" {
+    hostname "x"
+    upstream "https://x.example"
+}
+`,
+	}
+	for name, src := range cases {
+		_, err := ParseConfig(strings.NewReader(src))
+		if err == nil {
+			t.Errorf("%s: expected error for unknown key, got nil", name)
+		}
+	}
+}
