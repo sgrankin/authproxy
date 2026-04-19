@@ -40,7 +40,11 @@ type Cache struct {
 	wg        sync.WaitGroup
 }
 
-const evictionInterval = time.Minute
+const (
+	evictionInterval  = time.Minute
+	etagFlushInterval = 30 * time.Second
+	etagsFile         = "etags.json"
+)
 
 // NewCache opens (or creates) a cache rooted at dir.
 func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
@@ -66,19 +70,24 @@ func NewCache(dir string, maxSize, chunkSize int64) (*Cache, error) {
 	if err := c.load(); err != nil {
 		return nil, err
 	}
+	c.loadEtags()
 	if maxSize > 0 {
 		c.wg.Add(1)
 		go c.evictLoop()
 	}
+	c.wg.Add(1)
+	go c.etagFlushLoop()
 	return c, nil
 }
 
-// Close stops background eviction. Safe to call multiple times.
+// Close stops background goroutines and flushes the etag map. Safe to call
+// multiple times.
 func (c *Cache) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeCh)
 	})
 	c.wg.Wait()
+	c.flushEtags() // final flush after background loop has stopped
 	return nil
 }
 
@@ -93,6 +102,69 @@ func (c *Cache) evictLoop() {
 		case <-t.C:
 			c.checkEviction()
 		}
+	}
+}
+
+func (c *Cache) etagFlushLoop() {
+	defer c.wg.Done()
+	t := time.NewTicker(etagFlushInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-t.C:
+			c.flushEtags()
+		}
+	}
+}
+
+// loadEtags reads the persisted URL→ETag map from disk into c.etags. Best
+// effort: on parse error, the map is left empty and we'll repopulate as
+// requests arrive.
+func (c *Cache) loadEtags() {
+	f, err := os.Open(filepath.Join(c.dir, etagsFile))
+	if err != nil {
+		return // missing file is normal on first run
+	}
+	defer f.Close()
+	loaded := map[string]string{}
+	if err := json.NewDecoder(f).Decode(&loaded); err != nil {
+		log.Printf("cache: decode %s: %v", etagsFile, err)
+		return
+	}
+	// Drop entries whose blob isn't present (might have been evicted between runs).
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for rk, etag := range loaded {
+		host, _, ok := strings.Cut(rk, " ")
+		if !ok {
+			continue
+		}
+		if _, exists := c.blobs[blobKeyFromHost(host, etag)]; exists {
+			c.etags[rk] = etag
+		}
+	}
+}
+
+// flushEtags writes the current URL→ETag map to disk, omitting entries whose
+// blob is no longer present.
+func (c *Cache) flushEtags() {
+	c.mu.Lock()
+	snap := make(map[string]string, len(c.etags))
+	for rk, etag := range c.etags {
+		host, _, ok := strings.Cut(rk, " ")
+		if !ok {
+			continue
+		}
+		if _, exists := c.blobs[blobKeyFromHost(host, etag)]; exists {
+			snap[rk] = etag
+		}
+	}
+	c.mu.Unlock()
+	path := filepath.Join(c.dir, etagsFile)
+	if err := writeJSONAtomic(path, snap); err != nil {
+		log.Printf("cache: flush %s: %v", etagsFile, err)
 	}
 }
 
@@ -179,8 +251,12 @@ func requestKeyFor(upstream *url.URL, r *http.Request) string {
 // matching ETag values (e.g. CDN-style sequential or shared mirror artifacts)
 // don't collide on the body cache.
 func blobKey(upstream *url.URL, etag string) string {
+	return blobKeyFromHost(upstream.Host, etag)
+}
+
+func blobKeyFromHost(host, etag string) string {
 	h := sha256.New()
-	h.Write([]byte(upstream.Host))
+	h.Write([]byte(host))
 	h.Write([]byte{0})
 	h.Write([]byte(etag))
 	return hex.EncodeToString(h.Sum(nil))

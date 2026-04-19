@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -475,6 +477,50 @@ func TestCache_LRUSkipsInFlight(t *testing.T) {
 	c.mu.Unlock()
 	if !has {
 		t.Error("in-flight blob should not be evicted")
+	}
+}
+
+func TestCache_EtagPersistence(t *testing.T) {
+	body := strings.Repeat("p", 32)
+	const etag = `"persisted"`
+
+	srv := fakeUpstream(body, etag, nil)
+	defer srv.Close()
+
+	dir := t.TempDir()
+
+	// First run: populate cache.
+	c1, err := NewCache(dir, 100<<20, 4<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := mustURL(t, srv.URL)
+	h1 := c1.Handler(u, nil)
+	h1.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/p", nil))
+	if err := c1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the etag file was written.
+	if _, err := os.Stat(filepath.Join(dir, "etags.json")); err != nil {
+		t.Fatalf("etags.json not written: %v", err)
+	}
+
+	// Second run: should load etags from disk.
+	c2, err := NewCache(dir, 100<<20, 4<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	c2.mu.Lock()
+	got, has := c2.etags[u.Host+" /p"]
+	c2.mu.Unlock()
+	if !has {
+		t.Errorf("etag for %q not loaded", u.Host+" /p")
+	}
+	if got != etag {
+		t.Errorf("loaded etag = %q, want %q", got, etag)
 	}
 }
 
